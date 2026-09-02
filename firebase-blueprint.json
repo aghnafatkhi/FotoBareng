@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "Represents a photobooth session room.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "status": { "type": "string", "enum": ["lobby", "countdown", "capturing", "result"] },
+        "hostId": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "expiresAt": { "type": "number" },
+        "captureAt": { "type": "number", "description": "Target timestamp for capturing" },
+        "sessionCount": { "type": "number" },
+        "resultImage": { "type": "string", "description": "Base64 data of the aggregated result image" }
+      },
+      "required": ["id", "status", "hostId", "createdAt", "expiresAt"]
+    },
+    "Participant": {
+      "title": "Participant",
+      "description": "Represents a user in a room.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "isReady": { "type": "boolean" },
+        "isHost": { "type": "boolean" },
+        "joinedAt": { "type": "number" },
+        "updatedAt": { "type": "number" },
+        "photoData": { "type": "string", "description": "Base64 data of the participant's captured photo" }
+      },
+      "required": ["id", "name", "isReady", "isHost", "joinedAt"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomId}": {
+      "schema": { "$ref": "#/entities/Room" },
+      "description": "Stores photobooth rooms."
+    },
+    "/rooms/{roomId}/participants/{participantId}": {
+      "schema": { "$ref": "#/entities/Participant" },
+      "description": "Stores participants for a specific room."
+    }
+  }
+}

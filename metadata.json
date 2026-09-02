@@ -1,0 +1,10 @@
+{
+  "name": "FotoBareng",
+  "description": "Public multiplayer remote photobooth untuk foto bersama dari tempat berbeda.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
