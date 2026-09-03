@@ -2,18 +2,20 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { FrameConfig, FrameSlot } from '@/lib/frames';
-import { Plus, Trash2, Copy, Image as ImageIcon, CheckCircle2, Eye, EyeOff } from 'lucide-react';
+import { Plus, Trash2, Copy, Image as ImageIcon, Check, Eye, EyeOff } from 'lucide-react';
 
 export default function CustomFrameEditor({
   onSave,
   onCancel,
   availableParticipants
 }: {
-  onSave: (config: FrameConfig, base64: string) => void;
+  onSave: (config: FrameConfig, blob: Blob, previewUrl: string) => Promise<void> | void;
   onCancel: () => void;
   availableParticipants: { name: string, index: number }[];
 }) {
   const [image, setImage] = useState<string | null>(null);
+  const [frameBlob, setFrameBlob] = useState<Blob | null>(null);
+  const [saving, setSaving] = useState(false);
   const [imgWidth, setImgWidth] = useState(0);
   const [imgHeight, setImgHeight] = useState(0);
   const [slots, setSlots] = useState<FrameSlot[]>([]);
@@ -44,7 +46,7 @@ export default function CustomFrameEditor({
     }
 
     if (file.size > 5 * 1024 * 1024) {
-      setError('Ukuran file terlalu besar. Maksimal 5MB.');
+      setError('Ukuran file maksimal 5MB.');
       return;
     }
 
@@ -69,15 +71,21 @@ export default function CustomFrameEditor({
         const ctx = canvas.getContext('2d');
         if (ctx) {
           ctx.drawImage(img, 0, 0, w, h);
-          // Compress to webp for transparency and smaller size
-          const compressed = canvas.toDataURL('image/webp', 0.8);
           setImgWidth(w);
           setImgHeight(h);
-          setImage(compressed);
+          const previewUrl = canvas.toDataURL('image/webp', 0.85);
+          setImage(previewUrl);
+
+          canvas.toBlob((blob) => {
+            if (blob) {
+              setFrameBlob(blob);
+            }
+          }, 'image/webp', 0.85);
         } else {
           setImgWidth(img.width);
           setImgHeight(img.height);
           setImage(img.src);
+          setFrameBlob(file);
         }
       };
       img.src = evt.target?.result as string;
@@ -141,65 +149,94 @@ export default function CustomFrameEditor({
     setSelectedSlotId(null);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (slots.length === 0) {
-      setError('Tambahkan area foto dulu.');
+      setError('Tambahkan area foto terlebih dahulu.');
       return;
     }
     
-    // Auto infer counts
-    let maxP = 0;
-    let maxR = 0;
-    slots.forEach(s => {
-      if (s.participantIndex > maxP) maxP = s.participantIndex;
-      if (s.roundIndex > maxR) maxR = s.roundIndex;
-    });
+    if (!frameBlob && !image) {
+      setError('Pilih frame gambar terlebih dahulu.');
+      return;
+    }
 
-    const config: FrameConfig = {
-      id: 'custom',
-      name: 'Custom Frame',
-      participantCount: maxP + 1,
-      roundCount: maxR + 1,
-      canvasWidth: imgWidth,
-      canvasHeight: imgHeight,
-      backgroundColor: '#ffffff',
-      slots: slots
-    };
+    setSaving(true);
+    setError('');
 
-    onSave(config, image!);
+    try {
+      let maxP = 0;
+      let maxR = 0;
+      slots.forEach(s => {
+        if (s.participantIndex > maxP) maxP = s.participantIndex;
+        if (s.roundIndex > maxR) maxR = s.roundIndex;
+      });
+
+      const config: FrameConfig = {
+        id: 'custom',
+        name: 'Frame Kustom',
+        participantCount: maxP + 1,
+        roundCount: maxR + 1,
+        canvasWidth: imgWidth,
+        canvasHeight: imgHeight,
+        backgroundColor: '#ffffff',
+        slots: slots
+      };
+
+      let blobToUpload = frameBlob;
+      if (!blobToUpload && image) {
+        const res = await fetch(image);
+        blobToUpload = await res.blob();
+      }
+
+      if (blobToUpload) {
+        await onSave(config, blobToUpload, image || '');
+      }
+    } catch (err: any) {
+      setError(err.message || 'Gagal menyimpan frame kustom.');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const selectedSlot = slots.find(s => s.id === selectedSlotId);
 
   return (
-    <div className="fixed inset-0 bg-[#fdfdfd] z-50 flex flex-col font-sans overflow-hidden">
-      <div className="flex items-center justify-between p-6 shrink-0 border-b border-neutral-100">
-        <h2 className="text-xl font-black uppercase tracking-tighter">Frame Kamu</h2>
-        <button onClick={onCancel} className="text-xs font-bold uppercase text-neutral-500 hover:text-neutral-900">Batal</button>
+    <div className="fixed inset-0 bg-white z-50 flex flex-col font-sans overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-5 py-4 shrink-0 border-b border-neutral-100">
+        <h2 className="text-base font-bold text-neutral-900">Frame Sendiri</h2>
+        <button 
+          onClick={onCancel} 
+          className="text-xs font-medium text-neutral-600 hover:text-neutral-900 px-2 py-1"
+        >
+          Batal
+        </button>
       </div>
 
       {!image ? (
         <div className="flex-1 flex items-center justify-center p-6">
-          <div className="max-w-sm w-full text-center space-y-6">
-            <div className="inline-flex items-center justify-center w-16 h-16 bg-neutral-100 rounded-full mb-2">
-              <ImageIcon className="w-8 h-8 text-neutral-400" />
+          <div className="max-w-sm w-full text-center space-y-4">
+            <div className="inline-flex items-center justify-center w-12 h-12 bg-neutral-100 rounded-full">
+              <ImageIcon className="w-6 h-6 text-neutral-400" />
             </div>
             <div>
-              <h3 className="text-2xl font-black tracking-tighter uppercase mb-2">Upload Frame</h3>
-              <p className="text-sm font-bold tracking-widest uppercase text-neutral-500">Gunakan PNG atau WebP dengan background transparan.</p>
+              <h3 className="text-xl font-bold text-neutral-900 mb-1">Upload Frame</h3>
+              <p className="text-xs text-neutral-500">
+                Gunakan PNG atau WebP dengan background transparan.
+              </p>
             </div>
             
-            {error && <p className="text-xs font-bold uppercase tracking-widest text-red-600">{error}</p>}
+            {error && <p className="text-xs text-red-600">{error}</p>}
             
-            <div className="relative">
+            <div className="relative pt-2">
               <input 
                 type="file" 
                 accept="image/png,image/webp" 
                 onChange={handleUpload}
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
               />
-              <div className="w-full h-14 flex items-center justify-center bg-blue-600 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-blue-700 active:scale-95 transition-all">
-                Pilih File
+              <div className="w-full h-12 flex items-center justify-center bg-blue-600 text-white rounded-xl font-medium text-sm hover:bg-blue-700 active:scale-[0.98] transition-all">
+                Pilih File Gambar
               </div>
             </div>
           </div>
@@ -207,15 +244,15 @@ export default function CustomFrameEditor({
       ) : (
         <div className="flex-1 flex flex-col md:flex-row overflow-hidden relative">
           {/* Main preview area */}
-          <div className="flex-1 bg-neutral-100 p-4 md:p-8 flex items-center justify-center overflow-hidden relative">
+          <div className="flex-1 bg-neutral-100 p-4 sm:p-6 flex items-center justify-center overflow-hidden relative">
             
-            <div className="absolute top-4 left-4 z-20 flex gap-2">
+            <div className="absolute top-4 left-4 z-20">
                <button 
                  onClick={() => setPreviewMode(!previewMode)}
-                 className="flex items-center gap-2 px-4 py-2 bg-white rounded-full shadow-sm text-[10px] font-bold uppercase tracking-widest text-neutral-700 hover:bg-neutral-50"
+                 className="flex items-center gap-1.5 px-3 py-1.5 bg-white rounded-lg shadow-xs text-xs font-medium text-neutral-700 hover:bg-neutral-50"
                >
-                 {previewMode ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                 {previewMode ? 'Edit Mode' : 'Preview'}
+                 {previewMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                 <span>{previewMode ? 'Mode Edit' : 'Pratinjau'}</span>
                </button>
             </div>
 
@@ -224,25 +261,21 @@ export default function CustomFrameEditor({
               className="relative max-w-full max-h-full"
               style={{ aspectRatio: `${imgWidth}/${imgHeight}` }}
             >
-              {/* The uploaded frame image, usually has transparent holes */}
-              {/* We put slots BEHIND the frame image so the frame overlays them correctly, 
-                  but for editing, we must put the interactive handlers in FRONT. */}
-              
-              {/* Slots rendering (behind frame for preview, but interactive layer is in front) */}
+              {/* Slots rendering (behind frame for preview) */}
               {slots.map((slot, idx) => (
                 <div 
                   key={slot.id}
-                  className="absolute bg-neutral-300 flex items-center justify-center border-2 border-white/50"
+                  className="absolute bg-neutral-300 flex items-center justify-center border border-white/60"
                   style={{
                     left: `${slot.x * 100}%`,
                     top: `${slot.y * 100}%`,
                     width: `${slot.width * 100}%`,
                     height: `${slot.height * 100}%`,
-                    zIndex: 1 // Behind frame image
+                    zIndex: 1
                   }}
                 >
-                  <span className="text-xs font-bold text-white uppercase tracking-widest text-center opacity-50 px-2">
-                    Area {idx + 1}<br/>(F{slot.roundIndex + 1})
+                  <span className="text-[11px] font-medium text-white/80 text-center px-1">
+                    Area {idx + 1}
                   </span>
                 </div>
               ))}
@@ -254,7 +287,7 @@ export default function CustomFrameEditor({
                 alt="Frame Template"
               />
 
-              {/* Interactive slot handles (In front of frame image) */}
+              {/* Interactive slot handles */}
               {!previewMode && containerSize.w > 0 && slots.map((slot, idx) => (
                 <DraggableSlot
                   key={`handle-${slot.id}`}
@@ -272,55 +305,43 @@ export default function CustomFrameEditor({
           </div>
 
           {/* Controls Panel */}
-          <div className="w-full md:w-80 bg-white border-t md:border-t-0 md:border-l border-neutral-100 flex flex-col shrink-0">
-             <div className="p-4 border-b border-neutral-100 overflow-x-auto flex gap-2 md:grid md:grid-cols-2 md:gap-3 shrink-0">
+          <div className="w-full md:w-80 bg-white border-t md:border-t-0 md:border-l border-neutral-200 flex flex-col shrink-0">
+             <div className="p-3 border-b border-neutral-100 flex gap-2 overflow-x-auto shrink-0">
                <button 
                  onClick={handleAddSlot}
                  disabled={slots.length >= 12}
-                 className="flex-1 whitespace-nowrap h-10 border border-neutral-200 text-neutral-800 rounded-lg font-bold uppercase tracking-widest text-[10px] hover:bg-neutral-50 active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                 className="h-9 px-3 border border-neutral-200 text-neutral-700 rounded-lg text-xs font-medium hover:bg-neutral-50 active:scale-[0.98] transition-all flex items-center gap-1.5 disabled:opacity-50 shrink-0"
                >
-                 <Plus className="w-3 h-3" /> Tambah Area Foto
-               </button>
-               <button 
-                 onClick={() => {
-                   if (window.confirm('Ganti file frame? Area foto akan direset.')) {
-                     setImage(null);
-                     setSlots([]);
-                     setSelectedSlotId(null);
-                   }
-                 }}
-                 className="flex-1 whitespace-nowrap h-10 border border-neutral-200 text-neutral-800 rounded-lg font-bold uppercase tracking-widest text-[10px] hover:bg-neutral-50 active:scale-95 transition-all flex items-center justify-center gap-2"
-               >
-                 Ganti File
+                 <Plus className="w-3.5 h-3.5" /> Tambah Area
                </button>
                {selectedSlot && (
                   <>
                      <button 
                        onClick={handleDuplicate}
-                       className="flex-1 whitespace-nowrap h-10 border border-neutral-200 text-neutral-800 rounded-lg font-bold uppercase tracking-widest text-[10px] hover:bg-neutral-50 active:scale-95 transition-all flex items-center justify-center gap-2"
+                       className="h-9 px-3 border border-neutral-200 text-neutral-700 rounded-lg text-xs font-medium hover:bg-neutral-50 active:scale-[0.98] transition-all flex items-center gap-1.5 shrink-0"
                      >
-                       <Copy className="w-3 h-3" /> Duplikat
+                       <Copy className="w-3.5 h-3.5" /> Duplikat
                      </button>
                      <button 
                        onClick={handleDelete}
-                       className="flex-1 whitespace-nowrap h-10 bg-red-50 text-red-600 rounded-lg font-bold uppercase tracking-widest text-[10px] hover:bg-red-100 active:scale-95 transition-all flex items-center justify-center gap-2"
+                       className="h-9 px-3 bg-red-50 text-red-600 rounded-lg text-xs font-medium hover:bg-red-100 active:scale-[0.98] transition-all flex items-center gap-1.5 shrink-0"
                      >
-                       <Trash2 className="w-3 h-3" /> Hapus
+                       <Trash2 className="w-3.5 h-3.5" /> Hapus
                      </button>
                   </>
                )}
              </div>
 
-             <div className="flex-1 p-6 overflow-y-auto">
+             <div className="flex-1 p-4 overflow-y-auto">
                {selectedSlot ? (
-                 <div className="space-y-6">
-                   <div className="inline-flex items-center justify-center px-3 py-1 bg-blue-100 text-blue-700 rounded text-[10px] font-bold uppercase tracking-widest">
-                     Area Terpilih
+                 <div className="space-y-4">
+                   <div className="text-xs font-semibold text-neutral-900">
+                     Pengaturan Area {slots.findIndex(s => s.id === selectedSlot.id) + 1}
                    </div>
                    
-                   <div className="space-y-4">
-                     <div className="group">
-                       <label className="block text-[10px] font-bold uppercase tracking-[0.2em] text-neutral-500 mb-2">
+                   <div className="space-y-3">
+                     <div>
+                       <label className="block text-xs font-medium text-neutral-600 mb-1">
                          Foto dari
                        </label>
                        <select 
@@ -329,7 +350,7 @@ export default function CustomFrameEditor({
                            const val = parseInt(e.target.value);
                            setSlots(slots.map(s => s.id === selectedSlot.id ? { ...s, participantIndex: val } : s));
                          }}
-                         className="w-full h-12 px-4 rounded-xl border border-neutral-200 bg-white text-sm font-bold uppercase tracking-widest outline-none focus:border-blue-600"
+                         className="w-full h-10 px-3 rounded-lg border border-neutral-300 bg-white text-sm outline-none focus:border-blue-600"
                        >
                          {availableParticipants.length > 0 ? (
                            availableParticipants.map(p => (
@@ -346,8 +367,8 @@ export default function CustomFrameEditor({
                        </select>
                      </div>
 
-                     <div className="group">
-                       <label className="block text-[10px] font-bold uppercase tracking-[0.2em] text-neutral-500 mb-2">
+                     <div>
+                       <label className="block text-xs font-medium text-neutral-600 mb-1">
                          Urutan foto
                        </label>
                        <select 
@@ -356,7 +377,7 @@ export default function CustomFrameEditor({
                            const val = parseInt(e.target.value);
                            setSlots(slots.map(s => s.id === selectedSlot.id ? { ...s, roundIndex: val } : s));
                          }}
-                         className="w-full h-12 px-4 rounded-xl border border-neutral-200 bg-white text-sm font-bold uppercase tracking-widest outline-none focus:border-blue-600"
+                         className="w-full h-10 px-3 rounded-lg border border-neutral-300 bg-white text-sm outline-none focus:border-blue-600"
                        >
                          {[0,1,2,3,4,5,6,7].map(i => (
                            <option key={i} value={i}>Foto {i + 1}</option>
@@ -366,19 +387,23 @@ export default function CustomFrameEditor({
                    </div>
                  </div>
                ) : (
-                 <div className="h-full flex flex-col items-center justify-center text-center opacity-50">
-                   <p className="text-xs font-bold uppercase tracking-widest text-neutral-500">Pilih area foto untuk mengatur.</p>
+                 <div className="h-full flex flex-col items-center justify-center text-center py-6">
+                   <p className="text-xs text-neutral-400">
+                     Pilih salah satu area di layar untuk mengatur.
+                   </p>
                  </div>
                )}
              </div>
 
-             <div className="p-4 border-t border-neutral-100 shrink-0">
-                {error && <p className="text-[10px] font-bold uppercase tracking-widest text-red-600 text-center mb-3">{error}</p>}
+             <div className="p-3 border-t border-neutral-100 shrink-0">
+                {error && <p className="text-xs text-red-600 text-center mb-2">{error}</p>}
                 <button 
                   onClick={handleSave}
-                  className="w-full h-14 flex items-center justify-center bg-blue-600 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-blue-700 active:scale-95 transition-all"
+                  disabled={saving}
+                  className="w-full h-11 flex items-center justify-center bg-blue-600 text-white rounded-xl font-medium text-xs hover:bg-blue-700 active:scale-[0.98] transition-all disabled:opacity-50"
                 >
-                  <CheckCircle2 className="w-4 h-4 mr-2" /> Pakai Frame
+                  <Check className="w-3.5 h-3.5 mr-1.5" /> 
+                  <span>{saving ? 'Menyimpan...' : 'Pakai Frame Ini'}</span>
                 </button>
              </div>
           </div>
@@ -408,17 +433,6 @@ function DraggableSlot({
   const startPos = useRef({ x: 0, y: 0 });
   const startSlot = useRef({ ...slot });
 
-  const pxRect = {
-    x: slot.x * containerSize.w,
-    y: slot.y * containerSize.w * (containerSize.h / containerSize.w), // y is normalized to height! Wait.
-  };
-  
-  // Correction: x, y, width, height are 0-1 relative to canvasWidth/canvasHeight.
-  // containerSize.w corresponds to canvasWidth, containerSize.h corresponds to canvasHeight.
-  const pX = slot.x * containerSize.w;
-  const pY = slot.y * containerSize.w * (containerSize.h / containerSize.w); 
-  // actually slot.y is 0-1 of height. So pY = slot.y * containerSize.h
-  // Let's make it simpler.
   const absX = slot.x * containerSize.w;
   const absY = slot.y * containerSize.h;
   const absW = slot.width * containerSize.w;
@@ -454,7 +468,6 @@ function DraggableSlot({
       let newX = startSlot.current.x + (dx / containerSize.w);
       let newY = startSlot.current.y + (dy / containerSize.h);
       
-      // Basic bounds
       newX = Math.max(0, Math.min(1 - startSlot.current.width, newX));
       newY = Math.max(0, Math.min(1 - startSlot.current.height, newY));
 
@@ -466,11 +479,9 @@ function DraggableSlot({
       let newW = startSlot.current.width + (dx / containerSize.w);
       let newH = startSlot.current.height + (dy / containerSize.h);
 
-      // Min size
       newW = Math.max(0.05, newW);
       newH = Math.max(0.05, newH);
       
-      // Max size (bounds)
       newW = Math.min(1 - startSlot.current.x, newW);
       newH = Math.min(1 - startSlot.current.y, newH);
 
@@ -487,7 +498,7 @@ function DraggableSlot({
 
   return (
     <div 
-      className={`absolute z-20 flex items-center justify-center cursor-move touch-none border-2 transition-colors ${isSelected ? 'border-blue-500 bg-blue-500/10' : 'border-neutral-400 border-dashed hover:border-blue-400 bg-white/5'}`}
+      className={`absolute z-20 flex items-center justify-center cursor-move touch-none border transition-colors ${isSelected ? 'border-blue-600 bg-blue-500/10' : 'border-neutral-400 border-dashed hover:border-blue-400 bg-white/5'}`}
       style={{
         left: `${absX}px`,
         top: `${absY}px`,
@@ -496,13 +507,13 @@ function DraggableSlot({
       }}
       onPointerDown={onPointerDown}
     >
-      <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-1 bg-white rounded shadow-sm ${isSelected ? 'text-blue-600' : 'text-neutral-500'}`}>
+      <span className={`text-[10px] font-semibold px-1.5 py-0.5 bg-white rounded shadow-xs ${isSelected ? 'text-blue-600' : 'text-neutral-600'}`}>
         {index}
       </span>
       
       {isSelected && (
         <div 
-          className="absolute -bottom-3 -right-3 w-6 h-6 bg-blue-600 border-2 border-white rounded-full cursor-nwse-resize shadow-sm flex items-center justify-center touch-none"
+          className="absolute -bottom-2.5 -right-2.5 w-5 h-5 bg-blue-600 border-2 border-white rounded-full cursor-nwse-resize shadow-xs flex items-center justify-center touch-none"
           onPointerDown={onResizePointerDown}
         />
       )}

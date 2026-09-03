@@ -30,6 +30,25 @@
         "photoData": { "type": "string", "description": "Base64 data of the participant's captured photo" }
       },
       "required": ["id", "name", "isReady", "isHost", "joinedAt"]
+    },
+    "PhotoboothSession": {
+      "title": "PhotoboothSession",
+      "description": "Represents an active or past photobooth session with synchronized rounds and captures.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "roomId": { "type": "string" },
+        "status": { "type": "string" },
+        "roundCount": { "type": "number" },
+        "currentRound": { "type": "number" },
+        "currentAttempt": { "type": "number" },
+        "scheduledAt": { "type": "number" },
+        "captureAt": { "type": "number" },
+        "revision": { "type": "number" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "roomId", "status", "roundCount", "currentRound", "currentAttempt", "captureAt"]
     }
   },
   "firestore": {
@@ -40,6 +59,10 @@
     "/rooms/{roomId}/participants/{participantId}": {
       "schema": { "$ref": "#/entities/Participant" },
       "description": "Stores participants for a specific room."
+    },
+    "/rooms/{roomId}/sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/PhotoboothSession" },
+      "description": "Stores photobooth sessions with snapshot config and captures."
     }
   }
 }

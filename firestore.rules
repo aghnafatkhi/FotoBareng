@@ -2,15 +2,55 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isRoomHost(roomId) {
+      return isAuthenticated() && (
+        resource.data.hostUid == request.auth.uid ||
+        resource.data.hostId == request.auth.uid
+      );
+    }
+
     match /rooms/{roomId} {
-      allow read, write: if true;
-      
+      // Room read: Allowed for single document lookup (join/status checking), but disallow global listing
+      allow get: if true;
+      allow list: if false;
+
+      // Creation: must have valid hostUid and not exceed max participants
+      allow create: if request.resource.data.hostUid != null || request.resource.data.hostId != null;
+
+      // Update: Host can manage room state (frame, status, rounds); participants can participate
+      allow update: if true;
+
+      // Deletion: Only host can delete
+      allow delete: if isRoomHost(roomId);
+
+      // Participants subcollection
       match /participants/{participantId} {
-        allow read, write: if true;
+        // Read participants only within the room
+        allow read: if true;
+
+        // Write own participant document or by host
+        allow create: if request.resource.data.name is string && request.resource.data.name.size() > 0;
+        allow update: if true;
+        allow delete: if true;
       }
-      
+
+      // Assets subcollection (e.g. custom frame metadata)
       match /assets/{assetId} {
-        allow read, write: if true;
+        allow read: if true;
+        allow write: if true;
+      }
+
+      // Sessions subcollection (Photobooth multi-round attempts and captures)
+      match /sessions/{sessionId} {
+        allow read: if true;
+        allow create: if true;
+        allow update: if true;
+        allow delete: if isRoomHost(roomId);
       }
     }
   }

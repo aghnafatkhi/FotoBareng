@@ -1,841 +1,934 @@
 'use client';
 
-import { useEffect, useState, useRef, use } from 'react';
+import { useState, use, useCallback, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { Camera, CheckCircle2, Circle, Download, Share, LayoutTemplate, PenTool } from 'lucide-react';
+import { Camera, Check, Download, Share2, LayoutTemplate, PenTool, AlertCircle, RefreshCw, Copy, LogOut, Move, RotateCcw } from 'lucide-react';
 import { db } from '@/lib/firebase';
-import { doc, getDoc, getDocs, setDoc, onSnapshot, collection, updateDoc, writeBatch } from 'firebase/firestore';
-import { generateParticipantId } from '@/lib/store';
+import { doc, getDoc, runTransaction } from 'firebase/firestore';
 import { OFFICIAL_FRAMES, FrameConfig } from '@/lib/frames';
+import { ensureAuthUser } from '@/lib/auth';
+import { mediaStorage } from '@/lib/mediaStorage';
+import { 
+  DEFAULT_MAX_PARTICIPANTS, 
+  MIN_NAME_LENGTH, 
+  MAX_NAME_LENGTH, 
+  sanitizeDisplayName 
+} from '@/lib/constants';
+import { useTimeSync } from '@/hooks/useTimeSync';
+import { useCamera } from '@/hooks/useCamera';
+import { useRoom } from '@/hooks/useRoom';
+import { useSession } from '@/hooks/useSession';
 import CustomFrameEditor from './CustomFrameEditor';
-
-type RoomStatus = 'waiting' | 'starting' | 'completed';
-
-interface Room {
-  id: string;
-  hostId: string;
-  status: RoomStatus;
-  frameId: string;
-  customFrame?: FrameConfig;
-  currentRound: number;
-  captureAt: number | null;
-  sessionCount: number;
-  createdAt: number;
-  resultImage?: string | null;
-}
-
-interface Participant {
-  id: string;
-  name: string;
-  participantIndex: number;
-  isReady: boolean;
-  isHost: boolean;
-  joinedAt: number;
-  photos: Record<number, string>;
-  updatedAt?: number;
-}
+import { CropRepositionModal } from '@/components/CropRepositionModal';
+import { DevDebugPanel } from '@/components/DevDebugPanel';
 
 export default function RoomPage({ params }: { params: Promise<{ roomCode: string }> }) {
   const router = useRouter();
   const { roomCode } = use(params);
   
-  const [room, setRoom] = useState<Room | null>(null);
-  const [participants, setParticipants] = useState<Participant[]>([]);
   const [participantId, setParticipantId] = useState<string | null>(null);
-  const [error, setError] = useState('');
-  const [resultError, setResultError] = useState(false);
-  
-  // Camera state
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const [cameraStatus, setCameraStatus] = useState<'loading'|'active'|'denied'|'not_found'|'busy'|'error'>('loading');
-  const [isOffline, setIsOffline] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [uploadError, setUploadError] = useState(false);
-  const [now, setNow] = useState<number>(0);
-  useEffect(() => {
-    setTimeout(() => setNow(Date.now()), 0);
-    const int = setInterval(() => setNow(Date.now()), 2000);
-    return () => clearInterval(int);
-  }, []);
-  
-  // Frame state
+  const [authChecked, setAuthChecked] = useState(false);
+  const [needJoin, setNeedJoin] = useState(false);
   const [showFrameSelector, setShowFrameSelector] = useState(false);
   const [showCustomEditor, setShowCustomEditor] = useState(false);
-  const [customAssetUrl, setCustomAssetUrl] = useState<string | null>(null);
-  
-  const selectedFrame = room?.frameId === 'custom' && room.customFrame 
-    ? room.customFrame 
-    : (room ? OFFICIAL_FRAMES.find(f => f.id === room.frameId) || OFFICIAL_FRAMES[0] : OFFICIAL_FRAMES[0]);
-  
-  // Countdown state
-  const [timeLeft, setTimeLeft] = useState(0);
-  const [flash, setFlash] = useState(false);
+  const [showLeaveModal, setShowLeaveModal] = useState(false);
+  const [showCancelSessionModal, setShowCancelSessionModal] = useState(false);
+  const [showCropModal, setShowCropModal] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  useEffect(() => {
-    const handleOnline = () => setIsOffline(false);
-    const handleOffline = () => setIsOffline(true);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-    setTimeout(() => setIsOffline(!navigator.onLine), 0);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
+  // Time Synchronization
+  const { getNow } = useTimeSync();
+
+  // Camera Management
+  const isCameraEnabled = !needJoin;
+  const { 
+    videoRef, 
+    cameraStatus, 
+    facingMode,
+    isMirrored,
+    hasMultipleCameras,
+    switchCamera,
+    switchError,
+    initCamera 
+  } = useCamera(isCameraEnabled);
+
+  // Room & Presence Management
+  const { 
+    room, 
+    participants, 
+    isHost, 
+    isMeReady, 
+    roomError, 
+    isOffline, 
+    setReady, 
+    changeFrame, 
+    saveCustomFrame, 
+    leaveRoom 
+  } = useRoom(roomCode, participantId);
+
+  // Session & Synchronization Management
+  const {
+    session,
+    selectedFrame,
+    timeLeft,
+    flash,
+    uploading,
+    uploadError,
+    resultError,
+    isMyCaptureDone,
+    isStarting,
+    isRetrying,
+    justCaptured,
+    lastCapturePreview,
+    startSession,
+    retryRound,
+    cancelSession,
+    startNewSession,
+    generateFinalResult,
+    saveCrops
+  } = useSession(roomCode, room, participants, participantId, videoRef, isMirrored);
+
+  // Toast Helper
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((current) => (current === msg ? null : current));
+    }, 2000);
   }, []);
 
-  async function capturePhoto() {
-    if (!room || !participantId || !videoRef.current) return;
-    
-    setFlash(true);
-    setTimeout(() => setFlash(false), 300);
-    
-    try {
-      const canvas = document.createElement('canvas');
-      const video = videoRef.current;
-      
-      const vRatio = video.videoWidth / video.videoHeight;
-      const targetRatio = 3/4;
-      
-      let sWidth = video.videoWidth;
-      let sHeight = video.videoHeight;
-      let sx = 0;
-      let sy = 0;
-      
-      if (vRatio > targetRatio) {
-        sWidth = video.videoHeight * targetRatio;
-        sx = (video.videoWidth - sWidth) / 2;
-      } else {
-        sHeight = video.videoWidth / targetRatio;
-        sy = (video.videoHeight - sHeight) / 2;
-      }
-      
-      canvas.width = 480;
-      canvas.height = 640;
-      
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-         ctx.translate(canvas.width, 0);
-         ctx.scale(-1, 1);
-         ctx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, canvas.width, canvas.height);
-         const base64 = canvas.toDataURL('image/jpeg', 0.7);
-         
-         setUploading(true);
-         setUploadError(false);
-         let success = false;
-         let attempts = 0;
-         while (!success && attempts < 3) {
-            try {
-              await updateDoc(doc(db, 'rooms', roomCode, 'participants', participantId), {
-                [`photos.${room.currentRound}`]: base64,
-                updatedAt: Date.now()
-              });
-              success = true;
-            } catch (err) {
-              attempts++;
-              await new Promise(r => setTimeout(r, 1000));
-            }
-         }
-         if (!success) setUploadError(true);
-         setUploading(false);
-      }
-    } catch (e) {
-      console.error('Failed to capture:', e);
-      setUploadError(true);
-      setUploading(false);
-    }
-  };
-
-  async function generateResult(parts: Participant[]) {
-    if (!room || room.status === 'completed') return;
-    
-    
-    try {
-      const canvas = document.createElement('canvas');
-    canvas.width = selectedFrame.canvasWidth;
-    canvas.height = selectedFrame.canvasHeight;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    ctx.fillStyle = selectedFrame.backgroundColor;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    
-    for (const slot of selectedFrame.slots) {
-      const p = parts.find(p => p.participantIndex === slot.participantIndex) || parts[0];
-      if (p && p.photos && p.photos[slot.roundIndex]) {
-        const img = new Image();
-        await new Promise(resolve => {
-          img.onload = resolve;
-          img.src = p.photos[slot.roundIndex];
-        });
-        
-        const sx = slot.x * canvas.width;
-        const sy = slot.y * canvas.height;
-        const sw = slot.width * canvas.width;
-        const sh = slot.height * canvas.height;
-        
-        ctx.save();
-        if (slot.borderRadius) {
-           const radius = slot.borderRadius * canvas.width;
-           ctx.beginPath();
-           ctx.moveTo(sx + radius, sy);
-           ctx.lineTo(sx + sw - radius, sy);
-           ctx.quadraticCurveTo(sx + sw, sy, sx + sw, sy + radius);
-           ctx.lineTo(sx + sw, sy + sh - radius);
-           ctx.quadraticCurveTo(sx + sw, sy + sh, sx + sw - radius, sy + sh);
-           ctx.lineTo(sx + radius, sy + sh);
-           ctx.quadraticCurveTo(sx, sy + sh, sx, sy + sh - radius);
-           ctx.lineTo(sx, sy + radius);
-           ctx.quadraticCurveTo(sx, sy, sx + radius, sy);
-           ctx.closePath();
-           ctx.clip();
-        }
-        
-        const targetRatio = sw / sh;
-        const imgRatio = img.width / img.height;
-        let cWidth = img.width;
-        let cHeight = img.height;
-        let cX = 0;
-        let cY = 0;
-        
-        if (imgRatio > targetRatio) {
-          cWidth = img.height * targetRatio;
-          cX = (img.width - cWidth) / 2;
-        } else {
-          cHeight = img.width / targetRatio;
-          cY = (img.height - cHeight) / 2;
-        }
-        
-        ctx.drawImage(img, cX, cY, cWidth, cHeight, sx, sy, sw, sh);
-        ctx.restore();
-      }
-    }
-    
-    if (selectedFrame.id === 'custom' && customAssetUrl) {
-      const frameImg = new Image();
-      await new Promise(resolve => {
-        frameImg.onload = resolve;
-        frameImg.src = customAssetUrl;
-      });
-      ctx.drawImage(frameImg, 0, 0, canvas.width, canvas.height);
-    }
-    
-    ctx.fillStyle = '#111827';
-    ctx.font = 'bold 32px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('FotoBareng', canvas.width / 2, canvas.height - 40);
-    
-    const finalBase64 = canvas.toDataURL('image/jpeg', 0.9);
-    
-      await updateDoc(doc(db, 'rooms', roomCode), {
-        status: 'completed',
-        resultImage: finalBase64
-      });
-    } catch (e) {
-      console.error(e);
-      setResultError(true);
-    }
-  };
-  const capturedSession = useRef(0); // Using this to prevent double captures per round
-  
-  // Initialize
+  // Initialize Auth & Check Membership
   useEffect(() => {
-    const pId = localStorage.getItem(`participant_${roomCode}`);
-    if (pId) {
-      setTimeout(() => setParticipantId(pId), 0);
-    } else {
-      setTimeout(() => setError("need_join"), 0);
+    let isMounted = true;
+    async function initAuth() {
+      try {
+        const authUid = await ensureAuthUser();
+        if (!isMounted) return;
+
+        const storedId = localStorage.getItem(`participant_${roomCode}`);
+        const effectiveId = storedId || authUid;
+
+        const partDoc = await getDoc(doc(db, 'rooms', roomCode, 'participants', effectiveId));
+        if (partDoc.exists()) {
+          localStorage.setItem(`participant_${roomCode}`, effectiveId);
+          setParticipantId(effectiveId);
+          setNeedJoin(false);
+        } else {
+          setNeedJoin(true);
+        }
+      } catch (err) {
+        console.warn('Auth init failed:', err);
+        setNeedJoin(true);
+      } finally {
+        if (isMounted) setAuthChecked(true);
+      }
     }
+    initAuth();
+    return () => { isMounted = false; };
   }, [roomCode]);
 
-  // Firebase Realtime Subscriptions
-  useEffect(() => {
-    if (!participantId || error === 'need_join') return;
-
-    // Room subscription
-    const unsubRoom = onSnapshot(doc(db, 'rooms', roomCode), (docSnap) => {
-      if (docSnap.exists()) {
-        setRoom(docSnap.data() as Room);
-      } else {
-        setError('not_found');
-      }
-    });
-
-    // Participants subscription
-    const unsubParticipants = onSnapshot(collection(db, 'rooms', roomCode, 'participants'), (snap) => {
-      const parts: Participant[] = [];
-      snap.forEach(d => parts.push(d.data() as Participant));
-      parts.sort((a, b) => a.joinedAt - b.joinedAt);
-      setParticipants(parts);
-    });
-
-    const interval = setInterval(() => {
-      if (participantId) {
-        updateDoc(doc(db, 'rooms', roomCode, 'participants', participantId), { updatedAt: Date.now() }).catch(()=>{});
-      }
-    }, 5000);
-
-    return () => {
-      unsubRoom();
-      unsubParticipants();
-      clearInterval(interval);
-    };
-  }, [roomCode, participantId, error]);
-  
-  // Host transfer logic
-  useEffect(() => {
-    if (!room || !participants.length || !participantId) return;
-    const host = participants.find(p => p.id === room.hostId);
-    const now = Date.now();
-    const isHostDead = !host || (now - (host.updatedAt || 0) > 15000);
-    const me = participants.find(p => p.id === participantId);
-    
-    if (isHostDead && !me?.isHost) {
-      const activeParts = participants.filter(p => (now - (p.updatedAt || 0) <= 15000));
-      activeParts.sort((a, b) => a.participantIndex - b.participantIndex);
-      if (activeParts[0]?.id === participantId) {
-        updateDoc(doc(db, 'rooms', roomCode), { hostId: participantId }).catch(()=>{});
-      }
-    }
-  }, [room, participants, participantId]);
-
-  // Fetch custom asset if needed
-  useEffect(() => {
-    if (room?.frameId === 'custom' && !customAssetUrl) {
-      getDoc(doc(db, 'rooms', roomCode, 'assets', 'customFrame')).then(snap => {
-        if (snap.exists()) {
-          setCustomAssetUrl(snap.data().dataUrl);
-        }
-      });
-    }
-  }, [room?.frameId, customAssetUrl, roomCode]);
-
-  // Camera setup
-  const initCamera = () => {
-    if (room?.status === 'completed') return;
-    
-    navigator.mediaDevices.getUserMedia({ 
-      video: { facingMode: 'user', aspectRatio: 3/4 } 
-    })
-    .then(stream => {
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        setCameraStatus('active');
-        const track = stream.getVideoTracks()[0];
-        if (track) {
-          track.onended = () => {
-            setCameraStatus('error');
-          };
-        }
-      }
-    })
-    .catch((err: any) => {
-      if (err.name === 'NotAllowedError') setCameraStatus('denied');
-      else if (err.name === 'NotFoundError') setCameraStatus('not_found');
-      else if (err.name === 'NotReadableError') setCameraStatus('busy');
-      else setCameraStatus('error');
-    });
-  };
-
-  useEffect(() => {
-    if (room?.status !== 'completed' && cameraStatus !== 'active' && cameraStatus !== 'denied' && cameraStatus !== 'not_found' && cameraStatus !== 'busy') {
-      initCamera();
-    }
-    
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && room?.status !== 'completed') {
-         if (videoRef.current && videoRef.current.srcObject) {
-           const stream = videoRef.current.srcObject as MediaStream;
-           const track = stream.getVideoTracks()[0];
-           if (!track || track.readyState === 'ended') {
-             initCamera();
-           }
-         } else {
-           initCamera();
-         }
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [room?.status]);
-
-  // Countdown & Capture
-  useEffect(() => {
-    if (room?.status === 'starting' && room.captureAt) {
-      const interval = setInterval(() => {
-        const remaining = room.captureAt! - Date.now();
-        setTimeLeft(Math.max(0, remaining));
-        
-        // Use combination of sessionCount and currentRound for tracking
-        const roundSig = room.sessionCount * 100 + room.currentRound;
-        if (remaining <= 0 && capturedSession.current !== roundSig) {
-          capturedSession.current = roundSig;
-          capturePhoto();
-        }
-      }, 50);
-      return () => clearInterval(interval);
-    }
-  }, [room?.status, room?.captureAt, room?.sessionCount, room?.currentRound]);
-
-
-  // Host: Progression & Aggregation logic
-  useEffect(() => {
-    if (!room || !participants.length || !participantId) return;
-    const me = participants.find(p => p.id === participantId);
-    if (!me?.isHost || room.status !== 'starting') return;
-
-    // Check if everyone required by the frame for this round has captured
-    // Wait for all connected participants to have photo for currentRound
-    // Though frame might say participantCount=2, we just wait for everyone in the room.
-    const allCaptured = participants.every(p => p.photos && p.photos[room.currentRound]);
-    const timeoutReached = room.captureAt && Date.now() > room.captureAt + 10000;
-    
-    if (allCaptured || timeoutReached) {
-      if (room.currentRound + 1 < selectedFrame.roundCount) {
-        // Next round
-        updateDoc(doc(db, 'rooms', roomCode), {
-          currentRound: room.currentRound + 1,
-          captureAt: Date.now() + 4000
+  const handleShare = useCallback(async () => {
+    const url = window.location.href;
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'FotoBareng',
+          text: 'Masuk room ini buat foto bareng!',
+          url,
         });
-      } else {
-        // All rounds complete, generate result
-        setTimeout(() => generateResult(participants), 0);
+      } catch {
+        // User dismissed share dialog
+      }
+    } else {
+      try {
+        await navigator.clipboard.writeText(url);
+        showToast('Link disalin.');
+      } catch {
+        showToast('Gagal menyalin link.');
       }
     }
-  }, [room, participants, participantId, selectedFrame]);
+  }, [showToast]);
 
+  const handleCopyCode = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(roomCode.toUpperCase());
+      showToast('Kode room disalin.');
+    } catch {
+      showToast('Gagal menyalin kode.');
+    }
+  }, [roomCode, showToast]);
 
-  const setReady = async (isReady: boolean) => {
-    if (!participantId) return;
-    await updateDoc(doc(db, 'rooms', roomCode, 'participants', participantId), {
-      isReady,
-      photos: {} // clear previous photos when readying up
-    });
-  };
+  const downloadResult = useCallback(async () => {
+    const targetUrl = session?.resultImage || room?.resultImage;
+    if (targetUrl) {
+      try {
+        const resolvedUrl = mediaStorage.resolveMediaUrl(targetUrl);
+        const res = await fetch(resolvedUrl);
+        const blob = await res.blob();
+        const objUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objUrl;
+        a.download = `fotobareng-${roomCode.toLowerCase()}.jpg`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+      } catch {
+        const a = document.createElement('a');
+        a.href = mediaStorage.resolveMediaUrl(targetUrl);
+        a.download = `fotobareng-${roomCode.toLowerCase()}.jpg`;
+        a.click();
+      }
+    }
+  }, [session?.resultImage, room?.resultImage, roomCode]);
 
-  const startSession = async () => {
-    if (!room) return;
-    await updateDoc(doc(db, 'rooms', roomCode), {
-      status: 'starting',
-      currentRound: 0,
-      captureAt: Date.now() + 4000,
-      sessionCount: room.sessionCount + 1
-    });
-  };
+  const handleConfirmLeave = useCallback(async () => {
+    setShowLeaveModal(false);
+    await leaveRoom();
+    router.push('/');
+  }, [leaveRoom, router]);
 
-  const resetSession = async () => {
-    if (!participantId) return;
-    
-    // Batch update to reset room and all participants ready state
-    const batch = writeBatch(db);
-    batch.update(doc(db, 'rooms', roomCode), {
-      status: 'waiting',
-      currentRound: 0,
-      resultImage: null
-    });
-    
-    participants.forEach(p => {
-      batch.update(doc(db, 'rooms', roomCode, 'participants', p.id), {
-        isReady: false,
-        photos: {}
-      });
-    });
-    
-    await batch.commit();
-  };
-  
-  const changeFrame = async (frameId: string) => {
-    if (!room) return;
-    const batch = writeBatch(db);
-    batch.update(doc(db, 'rooms', roomCode), {
-      frameId
-    });
-    // Reset ready states when frame changes
-    participants.forEach(p => {
-      batch.update(doc(db, 'rooms', roomCode, 'participants', p.id), {
-        isReady: false
-      });
-    });
-    await batch.commit();
-    setShowFrameSelector(false);
-  };
-
-  const saveCustomFrame = async (config: FrameConfig, base64Image: string) => {
-    if (!room) return;
-    const batch = writeBatch(db);
-    batch.update(doc(db, 'rooms', roomCode), {
-      frameId: 'custom',
-      customFrame: config
-    });
-    batch.set(doc(db, 'rooms', roomCode, 'assets', 'customFrame'), {
-      dataUrl: base64Image
-    });
-    
-    participants.forEach(p => {
-      batch.update(doc(db, 'rooms', roomCode, 'participants', p.id), {
-        isReady: false
-      });
-    });
-    
-    await batch.commit();
-    setCustomAssetUrl(base64Image);
+  const onCustomFrameSave = async (config: FrameConfig, blob: Blob) => {
+    await saveCustomFrame(config, blob);
     setShowCustomEditor(false);
     setShowFrameSelector(false);
   };
 
-  const handleShare = async () => {
-    const url = window.location.href;
-    if (navigator.share) {
-      await navigator.share({
-        title: 'FotoBareng',
-        text: 'Masuk room ini buat foto bareng!',
-        url,
-      });
-    } else {
-      await navigator.clipboard.writeText(url);
-      alert('Link disalin!');
-    }
-  };
-
-  const downloadResult = () => {
-    if (room?.resultImage) {
-      const a = document.createElement('a');
-      a.href = room.resultImage;
-      a.download = `fotobareng-${roomCode}.jpg`;
-      a.click();
-    }
-  };
-
-  if (error === 'need_join') {
-    return <JoinForm roomCode={roomCode} onSuccess={(id) => {
-      setParticipantId(id);
-      setError('');
-    }} />;
+  // Render Join Form if not yet a participant
+  if (needJoin && authChecked) {
+    return (
+      <JoinForm 
+        roomCode={roomCode} 
+        onSuccess={(id) => {
+          setParticipantId(id);
+          setNeedJoin(false);
+        }} 
+      />
+    );
   }
 
-  if (error === 'not_found') {
+  // Not Found State
+  if (roomError === 'not_found') {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center p-6 bg-[#fdfdfd]">
+      <div className="min-h-[100dvh] flex flex-col items-center justify-center p-6 bg-white">
         <div className="text-center max-w-sm w-full">
-          <h2 className="text-4xl font-black tracking-tighter uppercase mb-2 text-neutral-950">Room tidak ditemukan</h2>
-          <p className="text-sm font-bold tracking-widest uppercase text-neutral-500 mb-8">Cek kodenya lalu coba lagi.</p>
-          <button onClick={() => router.push('/')} className="w-full h-14 bg-blue-600 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-blue-700 active:scale-95 transition-all">Kembali ke Home</button>
+          <h2 className="text-2xl font-bold text-neutral-900 mb-2">Room tidak ditemukan</h2>
+          <p className="text-sm text-neutral-600 mb-6">Cek kodenya lalu coba lagi.</p>
+          <button 
+            onClick={() => router.push('/')} 
+            className="w-full h-12 bg-blue-600 text-white rounded-xl font-medium text-sm hover:bg-blue-700 active:scale-[0.98] transition-all flex items-center justify-center"
+          >
+            Kembali ke Home
+          </button>
         </div>
       </div>
     );
   }
 
-  
-  if (room && room.createdAt && now - room.createdAt > 24 * 60 * 60 * 1000) {
+  // Expired State
+  if (roomError === 'expired') {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center p-6 bg-[#fdfdfd]">
+      <div className="min-h-[100dvh] flex flex-col items-center justify-center p-6 bg-white">
         <div className="text-center max-w-sm w-full">
-          <h2 className="text-4xl font-black tracking-tighter uppercase mb-2 text-neutral-950">Room Berakhir</h2>
-          <p className="text-sm font-bold tracking-widest uppercase text-neutral-500 mb-8">Room ini sudah tidak aktif karena lewat dari 24 jam.</p>
-          <button onClick={() => router.push('/')} className="w-full h-14 bg-blue-600 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-blue-700 active:scale-95 transition-all">Buat Room Baru</button>
+          <h2 className="text-2xl font-bold text-neutral-900 mb-2">Room sudah berakhir</h2>
+          <p className="text-sm text-neutral-600 mb-6">Room ini sudah tidak aktif karena lewat dari 24 jam.</p>
+          <button 
+            onClick={() => router.push('/')} 
+            className="w-full h-12 bg-blue-600 text-white rounded-xl font-medium text-sm hover:bg-blue-700 active:scale-[0.98] transition-all flex items-center justify-center"
+          >
+            Buat Room Baru
+          </button>
         </div>
       </div>
     );
   }
 
-  if (!room || !participants.length) {
-    return <div className="min-h-screen flex items-center justify-center text-xs font-bold uppercase tracking-widest text-neutral-400 bg-[#fdfdfd]">Memuat room...</div>;
+  // Loading Room State
+  if (!room || !participants.length || !authChecked) {
+    return (
+      <div className="min-h-[100dvh] flex items-center justify-center text-sm font-medium text-neutral-500 bg-white">
+        Masuk ke room...
+      </div>
+    );
   }
 
-  const me = participants.find(p => p.id === participantId);
-  const allReady = participants.every(p => p.isReady);
-  const waitingForOthers = room.status === 'starting' && me?.photos && me.photos[room.currentRound];
+  // Determine Active High-Level View
+  const isLobby = room.status === 'waiting' && !session;
+  const isInSession = room.status === 'in_session' || (session && session.status !== 'completed' && session.status !== 'abandoned');
+  const isResult = (room.status === 'completed' || session?.status === 'completed') && !isLobby;
+
+  const allReady = participants.length >= selectedFrame.participantCount && participants.every(p => {
+    return p.isReady && (p.readyConfigVersion === (room.configVersion || 1) || p.readyConfigVersion === undefined);
+  });
+
+  const now = getNow();
+
+  // Find other participant names for waiting state
+  const otherParticipants = participants.filter(p => (p.uid || p.id) !== participantId);
+  const otherNames = otherParticipants.map(p => p.name).join(', ') || 'teman';
+
+  // Compute active slot and framing aspect ratio
+  const myParticipant = participants.find(p => (p.uid || p.id) === participantId);
+  const mySlotIndex = myParticipant?.slotIndex ?? 0;
+  const currentRound = session?.currentRound ?? 0;
+  const activeSlot = selectedFrame.slots.find(
+    s => s.participantIndex === mySlotIndex && s.roundIndex === currentRound
+  ) || selectedFrame.slots[0];
+  const slotAspect = activeSlot 
+    ? (activeSlot.width * selectedFrame.canvasWidth) / (activeSlot.height * selectedFrame.canvasHeight)
+    : 3 / 4;
 
   return (
-    <div className="flex flex-col flex-1 w-full h-full min-h-screen bg-[#fdfdfd] text-neutral-900 font-sans overflow-hidden">
-      <nav className="flex justify-between items-center px-6 md:px-12 py-6 md:py-10 shrink-0">
-        {isOffline && (
-          <div className="absolute top-0 left-0 right-0 bg-red-500 text-white text-xs font-bold uppercase tracking-widest text-center py-2 z-50">
-            Kamu sedang offline. Photobooth akan lanjut setelah koneksi kembali.
-          </div>
-        )}
-        {uploading && !uploadError && (
-          <div className="absolute top-0 left-0 right-0 bg-blue-500 text-white text-xs font-bold uppercase tracking-widest text-center py-2 z-50">
-            Mengirim foto...
-          </div>
-        )}
-        {uploadError && (
-          <div className="absolute top-0 left-0 right-0 bg-orange-500 text-white text-xs font-bold uppercase tracking-widest text-center py-2 z-50 flex justify-center items-center gap-4">
-            <span>Foto belum berhasil dikirim.</span>
-            <button onClick={capturePhoto} className="underline hover:text-orange-100">Coba Lagi</button>
-          </div>
-        )}
-        <div className="text-xl md:text-2xl font-black tracking-tighter uppercase cursor-pointer" onClick={() => router.push('/')}>FotoBareng</div>
-        {room.status === 'waiting' && (
-          <div className="flex gap-4">
-            <button onClick={handleShare} className="text-xs font-bold uppercase tracking-widest text-neutral-500 hover:text-blue-600 transition-colors flex items-center gap-2">
-              <Share className="w-4 h-4" /> Share Link
-            </button>
-          </div>
-        )}
-      </nav>
-
-      <main className="flex-1 flex flex-col items-center justify-center p-4 relative overflow-y-auto">
+    <div className="flex flex-col min-h-[100dvh] w-full bg-white text-neutral-900 selection:bg-blue-100">
       
-      {/* LOBBY VIEW */}
-      {room.status === 'waiting' && !showFrameSelector && (
-        <div className="w-full max-w-sm space-y-4 z-10 relative pb-10">
-          <div className="flex justify-between items-center bg-white p-5 shadow-[20px_20px_40px_-10px_rgba(0,0,0,0.05)] border border-neutral-100 mb-8">
-            <div>
-              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-neutral-400 mb-1">Kode Room</p>
-              <p className="text-2xl font-black tracking-tighter uppercase text-neutral-950">{roomCode.toUpperCase()}</p>
-            </div>
-          </div>
-          
-          <div className="bg-white p-4 shadow-[20px_20px_40px_-10px_rgba(0,0,0,0.05)] border border-neutral-100 flex items-center justify-between">
-             <div className="flex flex-col">
-               <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-neutral-400">Frame Aktif</span>
-               <span className="font-bold uppercase tracking-widest text-sm">{selectedFrame.name}</span>
-             </div>
-             {me?.isHost && (
-               <button onClick={() => setShowFrameSelector(true)} className="flex items-center gap-2 text-blue-600 text-xs font-bold uppercase tracking-widest hover:text-blue-700 p-2">
-                 <LayoutTemplate className="w-4 h-4" /> Ganti
-               </button>
-             )}
-          </div>
-
-          <div className="bg-neutral-100 p-2 shadow-[20px_20px_40px_-10px_rgba(0,0,0,0.05)] border border-neutral-200 relative overflow-hidden" style={{ aspectRatio: selectedFrame.slots[0] ? `${selectedFrame.slots[0].width * selectedFrame.canvasWidth} / ${selectedFrame.slots[0].height * selectedFrame.canvasHeight}` : '3/4' }}>
-            <video 
-              ref={videoRef} 
-              autoPlay 
-              playsInline 
-              muted 
-              className="absolute inset-0 w-full h-full object-cover scale-x-[-1]" 
-            />
-            {cameraStatus !== 'active' && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/90 p-6 text-center space-y-3 z-10">
-                <Camera className="w-8 h-8 text-neutral-400" />
-                <p className="text-sm font-medium text-neutral-600">
-                  {
-                  cameraStatus === 'denied' ? 'Kamera belum diizinkan. Buka izin kamera, lalu muat ulang.' : 
-                  cameraStatus === 'not_found' ? 'Kamera tidak ditemukan di perangkat ini.' :
-                  cameraStatus === 'busy' ? 'Kamera sedang dipakai aplikasi lain. Tutup lalu coba lagi.' :
-                  'Kamera terputus. Menyiapkan ulang...'
-}
-                </p>
-              </div>
-            )}
-            <div className="absolute top-2 left-2 bg-black/50 text-white px-2 py-1 text-[10px] uppercase font-bold tracking-widest rounded z-10">
-               Pratinjau
-            </div>
-          </div>
-          
-          {participants.length < selectedFrame.participantCount && (
-             <div className="bg-orange-50 border border-orange-200 text-orange-800 p-3 text-xs font-bold uppercase tracking-widest text-center rounded">
-                Frame ini butuh {selectedFrame.participantCount} orang.
-             </div>
-          )}
-
-          <div className="bg-white p-5 shadow-[20px_20px_40px_-10px_rgba(0,0,0,0.05)] border border-neutral-100 space-y-4">
-            <h3 className="text-[10px] font-bold uppercase tracking-[0.2em] text-neutral-400">Participants</h3>
-            <div className="space-y-3">
-            {participants.map(p => (
-              <div key={p.id} className="flex justify-between items-center">
-                <div className="flex items-center gap-2">
-                  <span className="font-bold text-neutral-900 uppercase text-sm tracking-widest flex items-center gap-2">
-                    {p.name} 
-                    {p.id === me?.id && <span className="text-neutral-400 font-normal tracking-normal normal-case">(Kamu)</span>}
-                    {(now - (p.updatedAt || 0) > 15000) && p.id !== me?.id && (
-                      <span className="text-[9px] uppercase font-bold tracking-widest px-1.5 py-0.5 bg-red-50 text-red-500 border border-red-100 rounded">Terputus</span>
-                    )}
-                  </span>
-                  {p.isHost && <span className="text-[9px] uppercase font-bold tracking-widest px-1.5 py-0.5 bg-blue-50 text-blue-600 border border-blue-100 rounded">Host</span>}
-                </div>
-                {p.isReady ? (
-                  <CheckCircle2 className="w-5 h-5 text-blue-600" />
-                ) : (
-                  <Circle className="w-5 h-5 text-neutral-300" />
-                )}
-              </div>
-            ))}
-            </div>
-          </div>
-
-          <div className="space-y-3 pt-4">
-            {!me?.isReady ? (
-              <button 
-                onClick={() => setReady(true)}
-                disabled={cameraStatus !== 'active' || participants.length < selectedFrame.participantCount}
-                className="w-full h-14 bg-blue-600 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-blue-700 active:scale-95 transition-all disabled:opacity-50"
-              >
-                Siap
-              </button>
-            ) : (
-              <button 
-                onClick={() => setReady(false)}
-                className="w-full h-14 border-2 border-neutral-200 text-neutral-800 rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-neutral-50 active:scale-95 transition-all"
-              >
-                Batal Siap
-              </button>
-            )}
-
-            {me?.isHost && (
-              <button 
-                onClick={startSession}
-                disabled={!allReady || participants.length < selectedFrame.participantCount}
-                className="w-full h-14 bg-neutral-900 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-neutral-800 active:scale-95 transition-all disabled:opacity-50"
-              >
-                {allReady ? 'Mulai' : 'Menunggu teman siap...'}
-              </button>
-            )}
-          </div>
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div 
+          role="status"
+          aria-live="polite"
+          className="fixed top-5 left-1/2 -translate-x-1/2 z-50 bg-neutral-900 text-white text-sm font-medium px-4 py-2 rounded-lg shadow-md transition-all"
+        >
+          {toastMessage}
         </div>
       )}
-      
-      {/* FRAME SELECTION */}
-      {room.status === 'waiting' && showFrameSelector && me?.isHost && !showCustomEditor && (
-         <div className="w-full max-w-sm space-y-6 z-10 relative pb-10">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-black uppercase tracking-tighter">Pilih Frame</h2>
-              <button onClick={() => setShowFrameSelector(false)} className="text-xs font-bold uppercase text-neutral-500 hover:text-neutral-900">Batal</button>
+
+      {/* Connection & Upload Status Banners */}
+      {isOffline && (
+        <div className="bg-red-600 text-white text-xs font-medium text-center py-2 px-4 z-40">
+          Koneksi terputus. Menunggu tersambung kembali...
+        </div>
+      )}
+      {uploading && (
+        <div className="bg-blue-600 text-white text-xs font-medium text-center py-2 px-4 z-40">
+          Menyimpan foto...
+        </div>
+      )}
+      {uploadError && (
+        <div className="bg-amber-600 text-white text-xs font-medium text-center py-2 px-4 z-40">
+          {uploadError}
+        </div>
+      )}
+
+      {/* Navbar (Visible in Lobby & Result) */}
+      {!isInSession && (
+        <header className="flex justify-between items-center px-5 sm:px-8 py-4 border-b border-neutral-100 shrink-0">
+          <button 
+            onClick={() => setShowLeaveModal(true)} 
+            className="text-lg font-bold tracking-tight text-neutral-900 hover:text-neutral-700 transition-colors"
+          >
+            FotoBareng
+          </button>
+
+          {isLobby && (
+            <div className="flex items-center gap-2 sm:gap-3">
+              <button 
+                onClick={handleShare} 
+                className="h-9 px-3 border border-neutral-200 text-neutral-700 hover:bg-neutral-50 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5"
+                aria-label="Bagikan link room"
+              >
+                <Share2 className="w-3.5 h-3.5" />
+                <span>Bagikan</span>
+              </button>
+              <button 
+                onClick={() => setShowLeaveModal(true)} 
+                className="h-9 px-3 text-neutral-500 hover:text-red-600 rounded-lg text-xs font-medium transition-colors flex items-center gap-1"
+                aria-label="Keluar room"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Keluar</span>
+              </button>
             </div>
+          )}
+        </header>
+      )}
+
+      <main className="flex-1 flex flex-col items-center justify-center p-4 sm:p-6 w-full max-w-lg mx-auto">
+        
+        {/* ========================================================= */}
+        {/* 1. LOBBY VIEW */}
+        {/* ========================================================= */}
+        {isLobby && !showFrameSelector && !showCustomEditor && (
+          <div className="w-full space-y-4">
             
-            <button 
-              onClick={() => setShowCustomEditor(true)}
-              className="w-full h-14 border-2 border-dashed border-blue-200 text-blue-600 bg-blue-50/50 rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-blue-100 hover:border-blue-300 active:scale-95 transition-all flex items-center justify-center gap-2 mb-2"
+            {/* Room Code & Frame Bar */}
+            <div className="flex items-center justify-between bg-neutral-50 p-3 rounded-xl border border-neutral-200">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-500">Room</span>
+                <span className="font-bold text-sm tracking-wider text-neutral-900">{roomCode.toUpperCase()}</span>
+                <button 
+                  onClick={handleCopyCode} 
+                  className="p-1 text-neutral-400 hover:text-neutral-700 transition-colors"
+                  title="Salin kode room"
+                  aria-label="Salin kode room"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-600 hidden sm:inline">{selectedFrame.name}</span>
+                {isHost ? (
+                  <button 
+                    onClick={() => setShowFrameSelector(true)} 
+                    className="text-xs font-medium text-blue-600 hover:text-blue-700 flex items-center gap-1 p-1"
+                  >
+                    <LayoutTemplate className="w-3.5 h-3.5" />
+                    <span>Ganti Frame</span>
+                  </button>
+                ) : (
+                  <span className="text-xs text-neutral-500">{selectedFrame.participantCount} Orang</span>
+                )}
+              </div>
+            </div>
+
+            {/* Camera Preview (Central & Largest Element) */}
+            <div 
+              className="relative w-full rounded-xl overflow-hidden bg-neutral-900 border border-neutral-200 flex items-center justify-center" 
+              style={{ aspectRatio: '3/4', maxHeight: '400px' }}
             >
-              <PenTool className="w-4 h-4" /> Pakai Frame Sendiri
-            </button>
-            
-            <div className="grid grid-cols-1 gap-4">
-               {OFFICIAL_FRAMES.map(f => (
-                  <div key={f.id} onClick={() => changeFrame(f.id)} className={`p-4 cursor-pointer border-2 transition-all ${room.frameId === f.id ? 'border-blue-600 bg-blue-50/30' : 'border-neutral-100 hover:border-neutral-200 bg-white'}`}>
-                     <div className="flex justify-between items-center">
-                        <div>
-                           <p className="font-bold uppercase tracking-widest text-sm text-neutral-900">{f.name}</p>
-                           <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-neutral-500 mt-1">{f.participantCount} Orang &bull; {f.roundCount} Foto</p>
-                        </div>
-                        {room.frameId === f.id && <CheckCircle2 className="text-blue-600 w-5 h-5" />}
-                     </div>
-                     <div className="mt-4 border border-neutral-200 bg-neutral-100 aspect-video relative flex items-center justify-center">
-                        {/* Simple CSS preview of layout */}
-                        <div 
-                           className="relative bg-white" 
-                           style={{
-                              width: '100%', 
-                              aspectRatio: `${f.canvasWidth}/${f.canvasHeight}`,
-                              maxHeight: '120px'
-                           }}
-                        >
-                           {f.slots.map(s => (
-                              <div key={s.id} className="absolute bg-neutral-300 border border-white" style={{
-                                 left: `${s.x * 100}%`,
-                                 top: `${s.y * 100}%`,
-                                 width: `${s.width * 100}%`,
-                                 height: `${s.height * 100}%`,
-                                 borderRadius: s.borderRadius ? `${s.borderRadius * 100}%` : '0'
-                              }} />
-                           ))}
-                        </div>
-                     </div>
-                     <button className="w-full mt-4 h-10 border border-neutral-200 text-neutral-900 font-bold uppercase tracking-widest text-[10px] hover:bg-neutral-50">
-                        Pakai Frame
-                     </button>
-                  </div>
-               ))}
-            </div>
-         </div>
-      )}
-
-      {/* CUSTOM FRAME EDITOR */}
-      {showCustomEditor && (
-        <CustomFrameEditor 
-          onSave={saveCustomFrame}
-          onCancel={() => setShowCustomEditor(false)}
-          availableParticipants={participants.map(p => ({ name: p.name, index: p.participantIndex }))}
-        />
-      )}
-
-      {/* COUNTDOWN VIEW */}
-      {room.status === 'starting' && (
-        <div className="fixed inset-0 z-50 bg-neutral-950 flex flex-col items-center justify-center">
-          {!waitingForOthers ? (
-            <>
               <video 
                 ref={videoRef} 
                 autoPlay 
                 playsInline 
                 muted 
-                className="absolute inset-0 w-full h-full object-cover scale-x-[-1] opacity-60" 
+                className={`absolute inset-0 w-full h-full object-cover ${isMirrored ? 'scale-x-[-1]' : ''}`} 
               />
               
-              <div className="absolute top-10 text-white font-bold tracking-widest uppercase text-sm z-20">
-                Foto {room.currentRound + 1} dari {selectedFrame.roundCount}
-              </div>
-              
-              {timeLeft > 0 && (
-                <div className="absolute inset-0 flex items-center justify-center z-10">
-                  <span className="text-[12rem] leading-none font-black tracking-tighter text-white drop-shadow-2xl">
-                    {Math.ceil(timeLeft / 1000)}
-                  </span>
+              {/* Subtle Framing Guide */}
+              {cameraStatus === 'active' && (
+                <div 
+                  className="absolute pointer-events-none border border-white/40 rounded-lg shadow-[0_0_0_9999px_rgba(0,0,0,0.25)] z-10 transition-all duration-300"
+                  style={{
+                    aspectRatio: `${slotAspect}`,
+                    width: slotAspect < 1 ? `${Math.min(85, 85 * slotAspect)}%` : '85%',
+                    maxHeight: '85%',
+                  }}
+                />
+              )}
+
+              {/* Switch Camera Button */}
+              {hasMultipleCameras && cameraStatus === 'active' && (
+                <button
+                  type="button"
+                  onClick={switchCamera}
+                  className="absolute top-3 right-3 z-20 w-9 h-9 rounded-full bg-black/40 hover:bg-black/60 text-white flex items-center justify-center backdrop-blur-xs transition-transform active:scale-95"
+                  aria-label="Ganti kamera"
+                  title="Ganti kamera (depan/belakang)"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                </button>
+              )}
+
+              {switchError && (
+                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 bg-black/70 text-white text-[11px] px-2.5 py-1 rounded-md backdrop-blur-xs">
+                  {switchError}
                 </div>
               )}
 
-              {flash && (
-                <div className="absolute inset-0 bg-white z-50 animate-flash" />
+              {cameraStatus !== 'active' && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-neutral-50 p-6 text-center space-y-3 z-10">
+                  <Camera className="w-8 h-8 text-neutral-400" />
+                  <p className="text-sm font-medium text-neutral-700">
+                    {
+                      cameraStatus === 'denied' ? 'Kamera belum diizinkan.' : 
+                      cameraStatus === 'not_found' ? 'Kamera tidak ditemukan.' :
+                      cameraStatus === 'busy' ? 'Kamera sedang dipakai aplikasi lain.' :
+                      'Menyiapkan kamera...'
+                    }
+                  </p>
+                  <p className="text-xs text-neutral-500">
+                    {cameraStatus === 'denied' ? 'Coba aktifkan izin kamera di pengaturan browser.' : ''}
+                  </p>
+                  <button 
+                    onClick={() => initCamera()} 
+                    className="h-9 px-4 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700 transition-colors"
+                  >
+                    Coba Lagi
+                  </button>
+                </div>
               )}
-            </>
-          ) : (
-            <div className="text-center space-y-4 z-10">
-              <div className="inline-flex items-center justify-center w-16 h-16 bg-white/10 rounded-full mb-4">
-                <CheckCircle2 className="w-8 h-8 text-white" />
-              </div>
-              <h2 className="text-3xl font-black tracking-tighter uppercase text-white">Bagus.</h2>
-              <p className="text-sm font-bold tracking-widest uppercase text-neutral-400">Menunggu {participants.length - 1} orang lain...</p>
             </div>
-          )}
-        </div>
-      )}
 
-      {/* RESULT VIEW */}
-      {room.status === 'completed' && (
-        <div className="w-full max-w-sm space-y-6 z-10 relative flex flex-col h-full py-8">
-          <div className="text-center space-y-2">
-            <h2 className="text-4xl font-black tracking-tighter uppercase text-neutral-950">Foto selesai.</h2>
-            <p className="text-sm font-bold tracking-widest uppercase text-neutral-500">Ini hasil foto bareng kalian.</p>
-          </div>
-
-          <div className="flex-1 min-h-0 flex items-center justify-center bg-white shadow-[20px_20px_40px_-10px_rgba(0,0,0,0.05)] border border-neutral-100 p-4 overflow-hidden relative">
-            {room.resultImage ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={room.resultImage} alt="Result" className="w-full h-full object-contain" />
-            ) : resultError ? (
-                <div className="text-center space-y-4">
-                  <p className="text-xs font-bold uppercase tracking-widest text-red-500">Foto belum berhasil dibuat.</p>
-                  <button onClick={() => generateResult(participants)} className="px-4 py-2 border border-neutral-200 rounded text-xs font-bold uppercase hover:bg-neutral-50 active:scale-95">Coba Lagi</button>
-                </div>
-            ) : (
-                <div className="animate-pulse text-xs font-bold uppercase tracking-widest text-neutral-400">Memproses komposisi foto...</div>
+            {/* Participant Requirement Warning */}
+            {participants.length < selectedFrame.participantCount && (
+              <div className="p-3 bg-amber-50 border border-amber-200 text-amber-900 text-xs rounded-xl text-center">
+                Frame ini butuh {selectedFrame.participantCount} orang. Ajak teman bergabung dengan link.
+              </div>
             )}
-          </div>
 
-          <div className="space-y-4 pt-4">
+            {/* People in Room */}
+            <div className="bg-neutral-50 p-3.5 rounded-xl border border-neutral-200 space-y-2.5">
+              <div className="text-xs font-medium text-neutral-500">Orang di room</div>
+              <div className="space-y-2">
+                {participants.map(p => {
+                  const isPartHost = (room.hostUid || room.hostId) === (p.uid || p.id);
+                  const isSelf = (p.uid || p.id) === participantId;
+                  const isDisconnected = (now - (p.updatedAt || 0) > 15000) || p.presence === 'left';
+                  const isPartReady = p.isReady && (p.readyConfigVersion === (room.configVersion || 1) || p.readyConfigVersion === undefined);
+
+                  return (
+                    <div key={p.id || p.uid} className="flex justify-between items-center text-sm py-0.5">
+                      <div className="flex items-center gap-2 truncate">
+                        <span className="font-medium text-neutral-900 truncate">
+                          {p.name}
+                        </span>
+                        {isSelf && <span className="text-neutral-500 text-xs">(Kamu)</span>}
+                        {isPartHost && (
+                          <span className="text-[11px] font-medium text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded">
+                            Host
+                          </span>
+                        )}
+                        {isDisconnected && !isSelf && (
+                          <span className="text-xs text-red-600">Terputus</span>
+                        )}
+                      </div>
+
+                      <div>
+                        {isPartReady ? (
+                          <span className="text-xs font-medium text-blue-600 flex items-center gap-1">
+                            <Check className="w-3.5 h-3.5" /> Siap
+                          </span>
+                        ) : (
+                          <span className="text-xs text-neutral-400">Belum siap</span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="space-y-2 pt-2">
+              {!isMeReady ? (
+                <button 
+                  id="btn-ready"
+                  onClick={() => setReady(true)}
+                  disabled={cameraStatus !== 'active' || participants.length < selectedFrame.participantCount}
+                  className="w-full h-12 bg-blue-600 text-white rounded-xl font-medium text-sm hover:bg-blue-700 active:scale-[0.98] transition-all disabled:opacity-50 flex items-center justify-center"
+                >
+                  Siap
+                </button>
+              ) : (
+                <button 
+                  id="btn-unready"
+                  onClick={() => setReady(false)}
+                  className="w-full h-12 border border-neutral-300 text-neutral-700 bg-white rounded-xl font-medium text-sm hover:bg-neutral-50 active:scale-[0.98] transition-all flex items-center justify-center"
+                >
+                  Batal Siap
+                </button>
+              )}
+
+              {isHost && (
+                <div>
+                  <button 
+                    id="btn-start-session"
+                    onClick={startSession}
+                    disabled={!allReady || participants.length < selectedFrame.participantCount || isStarting}
+                    className="w-full h-12 bg-neutral-900 text-white rounded-xl font-medium text-sm hover:bg-neutral-800 active:scale-[0.98] transition-all disabled:opacity-40 flex items-center justify-center"
+                  >
+                    {isStarting ? 'Memulai...' : 'Mulai'}
+                  </button>
+                  {!allReady && (
+                    <p className="text-center text-xs text-neutral-500 mt-2">
+                      {participants.length < selectedFrame.participantCount 
+                        ? `Menunggu ${selectedFrame.participantCount - participants.length} orang lagi bergabung.` 
+                        : 'Menunggu semua orang siap.'}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* 2. FRAME SELECTION (HOST ONLY) */}
+        {/* ========================================================= */}
+        {isLobby && showFrameSelector && isHost && !showCustomEditor && (
+          <div className="w-full space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-neutral-100">
+              <h2 className="text-lg font-bold text-neutral-900">Pilih Frame</h2>
+              <button 
+                onClick={() => setShowFrameSelector(false)} 
+                className="text-xs font-medium text-neutral-600 hover:text-neutral-900"
+              >
+                Batal
+              </button>
+            </div>
+            
             <button 
-              onClick={downloadResult}
-              disabled={!room.resultImage}
-              className="w-full h-14 flex items-center justify-center gap-2 bg-blue-600 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-blue-700 active:scale-95 transition-all disabled:opacity-50"
+              onClick={() => setShowCustomEditor(true)}
+              className="w-full h-11 border border-dashed border-blue-300 text-blue-600 bg-blue-50/40 rounded-xl font-medium text-xs hover:bg-blue-50 transition-all flex items-center justify-center gap-2"
             >
-              <Download className="w-4 h-4" />
-              Download
+              <PenTool className="w-3.5 h-3.5" /> Pakai Frame Sendiri
             </button>
             
-            {me?.isHost && (
-              <button 
-                onClick={resetSession}
-                className="w-full h-14 border-2 border-neutral-200 text-neutral-800 rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-neutral-50 active:scale-95 transition-all"
-              >
-                Foto Lagi
-              </button>
+            <div className="grid grid-cols-1 gap-3">
+              {OFFICIAL_FRAMES.map(f => {
+                const isSelected = room.frameId === f.id;
+                return (
+                  <div 
+                    key={f.id} 
+                    onClick={() => {
+                      changeFrame(f.id);
+                      setShowFrameSelector(false);
+                    }} 
+                    className={`p-3.5 rounded-xl cursor-pointer border transition-all ${
+                      isSelected 
+                        ? 'border-blue-600 bg-blue-50/20' 
+                        : 'border-neutral-200 hover:border-neutral-300 bg-white'
+                    }`}
+                  >
+                    <div className="flex justify-between items-center mb-2">
+                      <div>
+                        <p className="font-semibold text-sm text-neutral-900">{f.name}</p>
+                        <p className="text-xs text-neutral-500">{f.participantCount} Orang — {f.roundCount} Foto</p>
+                      </div>
+                      {isSelected && (
+                        <div className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center">
+                          <Check className="w-3 h-3" />
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Frame Preview Blueprint */}
+                    <div className="w-full bg-neutral-100 rounded-lg p-2 flex items-center justify-center border border-neutral-200">
+                      <div 
+                        className="relative bg-white shadow-xs rounded" 
+                        style={{
+                          width: '120px', 
+                          aspectRatio: `${f.canvasWidth}/${f.canvasHeight}`,
+                        }}
+                      >
+                        {f.slots.map(s => (
+                          <div 
+                            key={s.id} 
+                            className="absolute bg-neutral-300 border border-white" 
+                            style={{
+                              left: `${s.x * 100}%`,
+                              top: `${s.y * 100}%`,
+                              width: `${s.width * 100}%`,
+                              height: `${s.height * 100}%`,
+                              borderRadius: s.borderRadius ? `${s.borderRadius * 100}%` : '2px'
+                            }} 
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* 3. CUSTOM FRAME EDITOR */}
+        {/* ========================================================= */}
+        {showCustomEditor && (
+          <CustomFrameEditor 
+            onSave={onCustomFrameSave}
+            onCancel={() => setShowCustomEditor(false)}
+            availableParticipants={participants.map(p => ({ name: p.name, index: p.slotIndex ?? p.participantIndex }))}
+          />
+        )}
+
+        {/* ========================================================= */}
+        {/* 4. ACTIVE PHOTOBOOTH SESSION (FULL-SCREEN MINIMALIST) */}
+        {/* ========================================================= */}
+        {isInSession && session && (
+          <div className="fixed inset-0 z-50 bg-black flex flex-col items-center justify-center h-[100dvh] pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+            
+            {/* RECOVERY VIEW */}
+            {session.status === 'recovery' ? (
+              <div className="text-center max-w-xs w-full p-6 space-y-4 z-20 bg-neutral-900 border border-neutral-800 rounded-2xl">
+                <div className="inline-flex items-center justify-center w-12 h-12 bg-amber-500/20 text-amber-400 rounded-full">
+                  <AlertCircle className="w-6 h-6" />
+                </div>
+                <h2 className="text-xl font-bold text-white">Foto belum berhasil</h2>
+                <p className="text-xs text-neutral-400">
+                  {session.recoveryReason || 'Foto teman belum terkirim.'}
+                </p>
+
+                {isHost ? (
+                  <div className="space-y-2 pt-2">
+                    <button 
+                      onClick={retryRound}
+                      disabled={isRetrying}
+                      className="w-full h-11 bg-blue-600 text-white rounded-xl font-medium text-xs hover:bg-blue-700 active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isRetrying ? 'animate-spin' : ''}`} /> 
+                      <span>{isRetrying ? 'Mengulang...' : 'Ulang Foto'}</span>
+                    </button>
+                    <button 
+                      onClick={() => setShowCancelSessionModal(true)}
+                      className="w-full h-11 border border-neutral-700 text-neutral-300 rounded-xl font-medium text-xs hover:bg-neutral-800 transition-all"
+                    >
+                      Batalkan Sesi
+                    </button>
+                  </div>
+                ) : (
+                  <div className="p-3 text-neutral-400 text-xs">
+                    Menunggu host...
+                  </div>
+                )}
+              </div>
+            ) : session.status === 'processing' ? (
+              /* PROCESSING COMPOSITE VIEW */
+              <div className="text-center space-y-3 z-20 p-6">
+                <div className="animate-spin inline-block w-8 h-8 border-3 border-white/20 border-t-white rounded-full" />
+                <h2 className="text-xl font-bold text-white">Menyusun foto...</h2>
+                <p className="text-xs text-neutral-400">Tunggu sebentar</p>
+                {resultError && (
+                  <div className="pt-2 space-y-2">
+                    <p className="text-xs text-red-400">{resultError}</p>
+                    <button 
+                      onClick={generateFinalResult} 
+                      className="h-9 px-4 bg-blue-600 text-white rounded-lg text-xs font-medium"
+                    >
+                      Coba Lagi
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : !isMyCaptureDone ? (
+              /* LIVE COUNTDOWN & CAMERA VIEW */
+              <>
+                <video 
+                  ref={videoRef} 
+                  autoPlay 
+                  playsInline 
+                  muted 
+                  className={`absolute inset-0 w-full h-full object-cover ${isMirrored ? 'scale-x-[-1]' : ''}`} 
+                />
+
+                {/* Subtle Framing Guide */}
+                <div 
+                  className="absolute pointer-events-none border border-white/40 rounded-lg shadow-[0_0_0_9999px_rgba(0,0,0,0.3)] z-10 transition-all duration-300"
+                  style={{
+                    aspectRatio: `${slotAspect}`,
+                    width: slotAspect < 1 ? `${Math.min(85, 85 * slotAspect)}%` : '85%',
+                    maxHeight: '80%',
+                  }}
+                />
+
+                {/* Switch Camera Button (available before countdown fires) */}
+                {hasMultipleCameras && timeLeft === 0 && (
+                  <button
+                    type="button"
+                    onClick={switchCamera}
+                    className="absolute top-5 right-5 z-30 w-10 h-10 rounded-full bg-black/40 hover:bg-black/60 text-white flex items-center justify-center backdrop-blur-xs transition-transform active:scale-95"
+                    aria-label="Ganti kamera"
+                    title="Ganti kamera"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
+                )}
+                
+                {/* Round indicator */}
+                <div className="absolute top-6 left-1/2 -translate-x-1/2 text-white bg-black/50 backdrop-blur-xs px-3.5 py-1.5 rounded-full font-medium text-xs z-20">
+                  Foto {session.currentRound + 1} dari {session.roundCount}
+                  {session.currentAttempt > 1 && (
+                    <span className="ml-2 text-neutral-300">#{session.currentAttempt}</span>
+                  )}
+                </div>
+                
+                {/* Lead-in ("Bersiap...") & Clean Countdown (3-2-1) */}
+                {timeLeft > 0 && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center z-20 pointer-events-none">
+                    {timeLeft > 3000 ? (
+                      <div className="text-white text-xl sm:text-2xl font-bold bg-black/50 backdrop-blur-xs px-5 py-2.5 rounded-full animate-pulse tracking-wide">
+                        {session.currentRound > 0 && session.currentAttempt === 1 ? 'Foto berikutnya...' : 'Bersiap...'}
+                      </div>
+                    ) : (
+                      <span className="text-8xl sm:text-9xl font-bold text-white drop-shadow-xl transition-transform">
+                        {Math.ceil(timeLeft / 1000)}
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                {/* Brief 120ms Capture Flash */}
+                {flash && (
+                  <div className="absolute inset-0 bg-white z-50 animate-flash" />
+                )}
+
+                {/* Immediate Capture Feedback Overlay */}
+                {justCaptured && lastCapturePreview && (
+                  <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+                    <div className="w-44 h-56 rounded-xl overflow-hidden shadow-2xl border-2 border-white mb-3">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={lastCapturePreview} alt="Preview Foto" className="w-full h-full object-cover" />
+                    </div>
+                    <span className="text-white text-xs font-semibold bg-neutral-900/90 px-3.5 py-1.5 rounded-full border border-neutral-700">
+                      Foto diambil!
+                    </span>
+                  </div>
+                )}
+              </>
+            ) : (
+              /* WAITING FOR OTHER PARTICIPANTS VIEW */
+              <div className="text-center space-y-3 z-20 p-6 bg-black/60 backdrop-blur-sm rounded-2xl max-w-xs mx-auto border border-white/10">
+                {lastCapturePreview ? (
+                  <div className="w-24 h-32 mx-auto rounded-lg overflow-hidden border border-white/20 mb-1">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={lastCapturePreview} alt="Preview Foto" className="w-full h-full object-cover" />
+                  </div>
+                ) : (
+                  <div className="inline-flex items-center justify-center w-10 h-10 bg-white/20 rounded-full mb-1">
+                    <Check className="w-5 h-5 text-white" />
+                  </div>
+                )}
+                <h2 className="text-lg font-bold text-white">Foto sudah diambil.</h2>
+                <p className="text-xs text-neutral-300">Menunggu {otherNames}...</p>
+              </div>
             )}
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* 5. FINAL RESULT VIEW */}
+        {/* ========================================================= */}
+        {isResult && (
+          <div className="w-full space-y-4">
+            <div className="text-center">
+              <h2 className="text-2xl font-bold text-neutral-900">Foto selesai</h2>
+            </div>
+
+            {/* Clean Result Image Container */}
+            <div className="w-full bg-neutral-100 rounded-xl border border-neutral-200 p-2 overflow-hidden flex items-center justify-center min-h-[300px] max-h-[460px]">
+              {(session?.resultImage || room?.resultImage) ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img 
+                  src={mediaStorage.resolveMediaUrl(session?.resultImage || room?.resultImage || '')} 
+                  alt="Hasil Foto" 
+                  className="w-full h-full max-h-[440px] object-contain rounded-lg" 
+                />
+              ) : (
+                <div className="text-xs font-medium text-neutral-400">Menyiapkan foto...</div>
+              )}
+            </div>
+
+            {/* Action Buttons */}
+            <div className="space-y-2 pt-1">
+              <button 
+                id="btn-download"
+                onClick={downloadResult}
+                disabled={!session?.resultImage && !room?.resultImage}
+                className="w-full h-12 flex items-center justify-center gap-2 bg-blue-600 text-white rounded-xl font-medium text-sm hover:bg-blue-700 active:scale-[0.98] transition-all disabled:opacity-50"
+              >
+                <Download className="w-4 h-4" />
+                Download
+              </button>
+
+              {/* Crop & Reposition Button (Available for Host when session has result) */}
+              {isHost && session && (session.resultImage || room?.resultImage) && (
+                <button
+                  onClick={() => setShowCropModal(true)}
+                  className="w-full h-11 border border-neutral-300 text-neutral-700 bg-white hover:bg-neutral-50 rounded-xl font-medium text-xs flex items-center justify-center gap-1.5 transition-colors active:scale-[0.98]"
+                >
+                  <Move className="w-3.5 h-3.5 text-neutral-500" />
+                  <span>Atur Posisi Foto</span>
+                </button>
+              )}
+              
+              {isHost ? (
+                <div className="grid grid-cols-2 gap-2">
+                  <button 
+                    id="btn-retake"
+                    onClick={startNewSession}
+                    className="h-12 border border-neutral-300 text-neutral-800 bg-white rounded-xl font-medium text-sm hover:bg-neutral-50 active:scale-[0.98] transition-all flex items-center justify-center"
+                  >
+                    Foto Lagi
+                  </button>
+                  <button 
+                    onClick={() => {
+                      startNewSession();
+                      setShowFrameSelector(true);
+                    }}
+                    className="h-12 border border-neutral-200 text-neutral-600 bg-white rounded-xl font-medium text-sm hover:bg-neutral-50 active:scale-[0.98] transition-all flex items-center justify-center"
+                  >
+                    Ganti Frame
+                  </button>
+                </div>
+              ) : (
+                <p className="text-center text-xs text-neutral-500 py-2">
+                  Menunggu host untuk foto lagi.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Development Debug Panel */}
+        <DevDebugPanel 
+          room={room} 
+          session={session} 
+          participants={participants} 
+          participantId={participantId} 
+        />
+      </main>
+
+      {/* Crop & Reposition Modal */}
+      {showCropModal && session && (
+        <CropRepositionModal
+          isOpen={showCropModal}
+          onClose={() => setShowCropModal(false)}
+          session={session}
+          onSaveCrops={saveCrops}
+        />
+      )}
+
+      {/* Cancel Session Confirmation Modal */}
+      {showCancelSessionModal && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-5 max-w-xs w-full shadow-lg space-y-4 text-center">
+            <h3 className="text-base font-bold text-neutral-900">Batalkan sesi foto?</h3>
+            <p className="text-xs text-neutral-600">Proses foto yang sedang berjalan akan dihentikan dan kembali ke room.</p>
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button 
+                onClick={() => setShowCancelSessionModal(false)}
+                className="h-10 border border-neutral-300 text-neutral-700 rounded-xl font-medium text-xs hover:bg-neutral-50"
+              >
+                Batal
+              </button>
+              <button 
+                onClick={async () => {
+                  setShowCancelSessionModal(false);
+                  await cancelSession();
+                }}
+                className="h-10 bg-red-600 text-white rounded-xl font-medium text-xs hover:bg-red-700"
+              >
+                Batalkan
+              </button>
+            </div>
           </div>
         </div>
       )}
 
-      </main>
+      {/* Leave Room Confirmation Modal */}
+      {showLeaveModal && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-5 max-w-xs w-full shadow-lg space-y-4">
+            <h3 className="text-base font-bold text-neutral-900">Keluar dari room?</h3>
+            <p className="text-xs text-neutral-600">Kamu akan meninggalkan photobooth ini.</p>
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button 
+                onClick={() => setShowLeaveModal(false)}
+                className="h-10 border border-neutral-300 text-neutral-700 rounded-xl font-medium text-xs hover:bg-neutral-50"
+              >
+                Batal
+              </button>
+              <button 
+                onClick={handleConfirmLeave}
+                className="h-10 bg-red-600 text-white rounded-xl font-medium text-xs hover:bg-red-700"
+              >
+                Keluar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -847,44 +940,83 @@ function JoinForm({ roomCode, onSuccess }: { roomCode: string, onSuccess: (id: s
 
   const handleJoin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) {
+    const cleanName = sanitizeDisplayName(name);
+    if (cleanName.length < MIN_NAME_LENGTH) {
       setError('Nama belum diisi.');
       return;
     }
+    if (cleanName.length > MAX_NAME_LENGTH) {
+      setError(`Nama maksimal ${MAX_NAME_LENGTH} karakter.`);
+      return;
+    }
+
     setLoading(true);
+    setError('');
     
     try {
-      const roomSnap = await getDoc(doc(db, 'rooms', roomCode));
-      if (!roomSnap.exists()) {
-        throw new Error('Room tidak ditemukan.');
-      }
-      
-      const roomData = roomSnap.data();
-      if (roomData.status !== 'waiting') {
-        throw new Error('Sesi sedang berlangsung.');
-      }
-
-      // Get current participants to determine index
-      const partsSnap = await getDocs(collection(db, 'rooms', roomCode, 'participants'));
-      const currentIndex = partsSnap.size;
-      if (currentIndex >= 12) throw new Error("Room sudah penuh.");
-
-      const participantId = generateParticipantId();
+      const authUid = await ensureAuthUser();
       const now = Date.now();
 
-      await setDoc(doc(db, 'rooms', roomCode, 'participants', participantId), {
-        id: participantId,
-        name: name.trim(),
-        participantIndex: currentIndex,
-        isReady: false,
-        isHost: false,
-        joinedAt: now,
-        updatedAt: now,
-        photos: {}
+      await runTransaction(db, async (transaction) => {
+        const roomRef = doc(db, 'rooms', roomCode);
+        const roomSnap = await transaction.get(roomRef);
+        
+        if (!roomSnap.exists()) {
+          throw new Error('Room tidak ditemukan.');
+        }
+        
+        const roomData = roomSnap.data();
+        if (roomData.expiresAt && now > roomData.expiresAt) {
+          throw new Error('Room sudah berakhir.');
+        }
+
+        if (roomData.status !== 'waiting') {
+          throw new Error('Sesi sedang berlangsung.');
+        }
+
+        const maxAllowed = roomData.maxParticipants || DEFAULT_MAX_PARTICIPANTS;
+        const currentSlots: (string | null)[] = Array.isArray(roomData.slots) 
+          ? [...roomData.slots] 
+          : [roomData.hostUid || roomData.hostId || null, null];
+
+        while (currentSlots.length < maxAllowed) currentSlots.push(null);
+
+        const existingSlotIdx = currentSlots.indexOf(authUid);
+        let allocatedSlot = existingSlotIdx;
+
+        if (allocatedSlot === -1) {
+          const vacantIdx = currentSlots.findIndex(s => s === null || s === undefined);
+          if (vacantIdx === -1) {
+            throw new Error(`Room sudah penuh (maksimal ${maxAllowed} orang).`);
+          }
+          allocatedSlot = vacantIdx;
+          currentSlots[allocatedSlot] = authUid;
+        }
+
+        transaction.update(roomRef, {
+          slots: currentSlots,
+          updatedAt: now
+        });
+
+        const participantRef = doc(db, 'rooms', roomCode, 'participants', authUid);
+        transaction.set(participantRef, {
+          id: authUid,
+          uid: authUid,
+          name: cleanName,
+          participantIndex: allocatedSlot,
+          slotIndex: allocatedSlot,
+          isReady: false,
+          readyConfigVersion: roomData.configVersion || 1,
+          isHost: (roomData.hostUid || roomData.hostId) === authUid,
+          presence: 'connected',
+          joinedAt: now,
+          updatedAt: now,
+          photos: {}
+        }, { merge: true });
       });
       
-      localStorage.setItem(`participant_${roomCode}`, participantId);
-      onSuccess(participantId);
+      localStorage.setItem(`participant_${roomCode}`, authUid);
+      onSuccess(authUid);
     } catch (err: any) {
       setError(err.message || 'Gagal masuk room.');
       setLoading(false);
@@ -892,40 +1024,42 @@ function JoinForm({ roomCode, onSuccess }: { roomCode: string, onSuccess: (id: s
   };
 
   return (
-    <div className="flex flex-col flex-1 w-full h-full min-h-screen bg-[#fdfdfd] text-neutral-900 font-sans overflow-y-auto">
-      <nav className="flex justify-between items-center px-6 md:px-12 py-6 md:py-10">
-        <div className="text-xl md:text-2xl font-black tracking-tighter uppercase">FotoBareng</div>
-      </nav>
+    <div className="flex flex-col min-h-[100dvh] w-full bg-white text-neutral-900 selection:bg-blue-100">
+      <header className="px-5 sm:px-8 py-5 border-b border-neutral-100">
+        <span className="text-xl font-bold tracking-tight text-neutral-900">FotoBareng</span>
+      </header>
       
-      <main className="flex-1 flex flex-col items-center justify-center px-6 pb-12 w-full">
-        <div className="w-full max-w-sm">
-          <div className="text-center mb-10">
-            <h1 className="text-4xl font-black tracking-tighter uppercase mb-2 text-neutral-950">Masuk ke Room</h1>
-            <p className="text-sm text-neutral-500 font-bold tracking-widest uppercase">Room: {roomCode.toUpperCase()}</p>
+      <main className="flex-1 flex flex-col items-center justify-center px-5 py-8 w-full max-w-sm mx-auto">
+        <div className="w-full">
+          <div className="text-center mb-6">
+            <h1 className="text-2xl font-bold text-neutral-900 mb-1">Masuk ke Room</h1>
+            <p className="text-xs text-neutral-500">Kode room: <span className="font-semibold text-neutral-800">{roomCode.toUpperCase()}</span></p>
           </div>
 
-          <form onSubmit={handleJoin} className="space-y-6">
-            <div className="group">
-              <label htmlFor="join-name" className="block text-xs font-bold uppercase tracking-widest text-neutral-500 mb-3 group-focus-within:text-blue-600 transition-colors">
+          <form onSubmit={handleJoin} className="space-y-4">
+            <div>
+              <label htmlFor="invite-join-name" className="block text-sm font-medium text-neutral-700 mb-1.5">
                 Nama kamu
               </label>
               <input
-                id="join-name"
+                id="invite-join-name"
                 type="text"
                 placeholder="Contoh: Aghna"
+                autoComplete="name"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => { setName(e.target.value); setError(''); }}
                 disabled={loading}
-                className="w-full h-14 px-5 rounded-xl border border-neutral-200 bg-white text-lg font-medium outline-none focus:border-blue-600 focus:ring-4 focus:ring-blue-50/50 transition-all placeholder:text-neutral-300"
+                maxLength={MAX_NAME_LENGTH}
+                className="w-full h-12 px-4 rounded-xl border border-neutral-300 bg-white text-base text-neutral-900 outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100 transition-all placeholder:text-neutral-400"
               />
             </div>
             
-            {error && <p className="text-sm font-medium text-red-600">{error}</p>}
+            {error && <p className="text-xs text-red-600">{error}</p>}
             
             <button
               type="submit"
               disabled={loading}
-              className="w-full h-14 bg-blue-600 text-white rounded-xl font-bold uppercase tracking-widest text-xs hover:bg-blue-700 active:scale-95 transition-all disabled:opacity-50 mt-4"
+              className="w-full h-12 bg-blue-600 text-white rounded-xl font-medium text-sm hover:bg-blue-700 active:scale-[0.98] transition-all disabled:opacity-50 mt-2 flex items-center justify-center"
             >
               {loading ? 'Masuk...' : 'Masuk Room'}
             </button>
