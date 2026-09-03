@@ -5,7 +5,9 @@ import config from '../firebase-applet-config.json';
 
 // Initialize Firebase
 const app = !getApps().length ? initializeApp(config) : getApp();
-const db = getFirestore(app);
+const db = config.firestoreDatabaseId
+  ? getFirestore(app, config.firestoreDatabaseId)
+  : getFirestore(app);
 const auth = getAuth(app);
 
 export { app, db, auth, serverTimestamp };

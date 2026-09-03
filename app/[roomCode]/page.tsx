@@ -7,6 +7,7 @@ import { db } from '@/lib/firebase';
 import { doc, getDoc, runTransaction } from 'firebase/firestore';
 import { OFFICIAL_FRAMES, FrameConfig } from '@/lib/frames';
 import { ensureAuthUser } from '@/lib/auth';
+import { withTimeout, normalizeFirebaseError } from '@/lib/errors';
 import { mediaStorage } from '@/lib/mediaStorage';
 import { 
   DEFAULT_MAX_PARTICIPANTS, 
@@ -940,6 +941,8 @@ function JoinForm({ roomCode, onSuccess }: { roomCode: string, onSuccess: (id: s
 
   const handleJoin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return;
+
     const cleanName = sanitizeDisplayName(name);
     if (cleanName.length < MIN_NAME_LENGTH) {
       setError('Nama belum diisi.');
@@ -953,72 +956,90 @@ function JoinForm({ roomCode, onSuccess }: { roomCode: string, onSuccess: (id: s
     setLoading(true);
     setError('');
     
+    let stage = 'init';
     try {
+      stage = 'authenticating';
+      console.log('[JoinForm] authenticating');
       const authUid = await ensureAuthUser();
+      console.log('[JoinForm] auth ready', authUid);
+
+      stage = 'joining_room';
+      console.log('[JoinForm] joining room', roomCode);
       const now = Date.now();
 
-      await runTransaction(db, async (transaction) => {
-        const roomRef = doc(db, 'rooms', roomCode);
-        const roomSnap = await transaction.get(roomRef);
-        
-        if (!roomSnap.exists()) {
-          throw new Error('Room tidak ditemukan.');
-        }
-        
-        const roomData = roomSnap.data();
-        if (roomData.expiresAt && now > roomData.expiresAt) {
-          throw new Error('Room sudah berakhir.');
-        }
-
-        if (roomData.status !== 'waiting') {
-          throw new Error('Sesi sedang berlangsung.');
-        }
-
-        const maxAllowed = roomData.maxParticipants || DEFAULT_MAX_PARTICIPANTS;
-        const currentSlots: (string | null)[] = Array.isArray(roomData.slots) 
-          ? [...roomData.slots] 
-          : [roomData.hostUid || roomData.hostId || null, null];
-
-        while (currentSlots.length < maxAllowed) currentSlots.push(null);
-
-        const existingSlotIdx = currentSlots.indexOf(authUid);
-        let allocatedSlot = existingSlotIdx;
-
-        if (allocatedSlot === -1) {
-          const vacantIdx = currentSlots.findIndex(s => s === null || s === undefined);
-          if (vacantIdx === -1) {
-            throw new Error(`Room sudah penuh (maksimal ${maxAllowed} orang).`);
+      await withTimeout(
+        runTransaction(db, async (transaction) => {
+          const roomRef = doc(db, 'rooms', roomCode);
+          const roomSnap = await transaction.get(roomRef);
+          
+          if (!roomSnap.exists()) {
+            throw new Error('Room tidak ditemukan.');
           }
-          allocatedSlot = vacantIdx;
-          currentSlots[allocatedSlot] = authUid;
-        }
+          
+          const roomData = roomSnap.data();
+          if (roomData.expiresAt && now > roomData.expiresAt) {
+            throw new Error('Room sudah berakhir.');
+          }
 
-        transaction.update(roomRef, {
-          slots: currentSlots,
-          updatedAt: now
-        });
+          if (roomData.status !== 'waiting') {
+            throw new Error('Sesi sedang berlangsung.');
+          }
 
-        const participantRef = doc(db, 'rooms', roomCode, 'participants', authUid);
-        transaction.set(participantRef, {
-          id: authUid,
-          uid: authUid,
-          name: cleanName,
-          participantIndex: allocatedSlot,
-          slotIndex: allocatedSlot,
-          isReady: false,
-          readyConfigVersion: roomData.configVersion || 1,
-          isHost: (roomData.hostUid || roomData.hostId) === authUid,
-          presence: 'connected',
-          joinedAt: now,
-          updatedAt: now,
-          photos: {}
-        }, { merge: true });
-      });
+          const maxAllowed = roomData.maxParticipants || DEFAULT_MAX_PARTICIPANTS;
+          const currentSlots: (string | null)[] = Array.isArray(roomData.slots) 
+            ? [...roomData.slots] 
+            : [roomData.hostUid || roomData.hostId || null, null];
+
+          while (currentSlots.length < maxAllowed) currentSlots.push(null);
+
+          const existingSlotIdx = currentSlots.indexOf(authUid);
+          let allocatedSlot = existingSlotIdx;
+
+          if (allocatedSlot === -1) {
+            const vacantIdx = currentSlots.findIndex(s => s === null || s === undefined);
+            if (vacantIdx === -1) {
+              throw new Error(`Room sudah penuh (maksimal ${maxAllowed} orang).`);
+            }
+            allocatedSlot = vacantIdx;
+            currentSlots[allocatedSlot] = authUid;
+          }
+
+          transaction.update(roomRef, {
+            slots: currentSlots,
+            updatedAt: now
+          });
+
+          const participantRef = doc(db, 'rooms', roomCode, 'participants', authUid);
+          transaction.set(participantRef, {
+            id: authUid,
+            uid: authUid,
+            name: cleanName,
+            participantIndex: allocatedSlot,
+            slotIndex: allocatedSlot,
+            isReady: false,
+            readyConfigVersion: roomData.configVersion || 1,
+            isHost: (roomData.hostUid || roomData.hostId) === authUid,
+            presence: 'connected',
+            joinedAt: now,
+            updatedAt: now,
+            photos: {}
+          }, { merge: true });
+        }),
+        12000,
+        'FIRESTORE_TIMEOUT'
+      );
       
+      console.log('[JoinForm] join committed');
       localStorage.setItem(`participant_${roomCode}`, authUid);
       onSuccess(authUid);
     } catch (err: any) {
-      setError(err.message || 'Gagal masuk room.');
+      const normalized = normalizeFirebaseError(err);
+      console.error('[JoinForm] failed', {
+        stage,
+        code: normalized.code,
+        message: err?.message || normalized.message
+      });
+      setError(normalized.message);
       setLoading(false);
     }
   };
@@ -1061,7 +1082,7 @@ function JoinForm({ roomCode, onSuccess }: { roomCode: string, onSuccess: (id: s
               disabled={loading}
               className="w-full h-12 bg-blue-600 text-white rounded-xl font-medium text-sm hover:bg-blue-700 active:scale-[0.98] transition-all disabled:opacity-50 mt-2 flex items-center justify-center"
             >
-              {loading ? 'Masuk...' : 'Masuk Room'}
+              {loading ? 'Masuk...' : (error ? 'Coba Lagi' : 'Masuk Room')}
             </button>
           </form>
         </div>

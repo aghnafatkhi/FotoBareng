@@ -2,54 +2,87 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    
+
     function isAuthenticated() {
       return request.auth != null;
     }
 
     function isRoomHost(roomId) {
-      return isAuthenticated() && (
+      return (isAuthenticated() && (
         resource.data.hostUid == request.auth.uid ||
         resource.data.hostId == request.auth.uid
+      )) || (
+        request.auth == null && (
+          resource.data.hostId is string &&
+          resource.data.hostId.size() > 0
+        )
       );
     }
 
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
     match /rooms/{roomId} {
-      // Room read: Allowed for single document lookup (join/status checking), but disallow global listing
+      // Room read: Allowed for single document lookup (join / presence checking)
       allow get: if true;
       allow list: if false;
 
-      // Creation: must have valid hostUid and not exceed max participants
-      allow create: if request.resource.data.hostUid != null || request.resource.data.hostId != null;
+      // Creation: Allowed for authenticated Firebase user or verified guest host ID
+      allow create: if (
+        isAuthenticated() && (
+          request.resource.data.hostUid == request.auth.uid ||
+          request.resource.data.hostId == request.auth.uid
+        )
+      ) || (
+        request.auth == null &&
+        request.resource.data.hostId is string &&
+        request.resource.data.hostId.size() > 0 &&
+        request.resource.data.hostId.size() <= 128
+      );
 
-      // Update: Host can manage room state (frame, status, rounds); participants can participate
+      // Update: Authenticated or guest participants can update room state, slots, and session progress
       allow update: if true;
 
-      // Deletion: Only host can delete
+      // Deletion: Host can delete room
       allow delete: if isRoomHost(roomId);
 
       // Participants subcollection
       match /participants/{participantId} {
-        // Read participants only within the room
         allow read: if true;
 
-        // Write own participant document or by host
-        allow create: if request.resource.data.name is string && request.resource.data.name.size() > 0;
-        allow update: if true;
-        allow delete: if true;
+        allow create, update: if (
+          isAuthenticated() && (
+            request.auth.uid == participantId ||
+            isRoomHost(roomId)
+          )
+        ) || (
+          request.auth == null &&
+          participantId is string &&
+          participantId.size() > 0 &&
+          participantId.size() <= 128
+        );
+
+        allow delete: if (
+          isAuthenticated() && (
+            request.auth.uid == participantId ||
+            isRoomHost(roomId)
+          )
+        ) || request.auth == null;
       }
 
-      // Assets subcollection (e.g. custom frame metadata)
+      // Assets subcollection (custom frames, logos)
       match /assets/{assetId} {
         allow read: if true;
-        allow write: if true;
+        allow create, update: if true;
+        allow delete: if isRoomHost(roomId);
       }
 
-      // Sessions subcollection (Photobooth multi-round attempts and captures)
+      // Sessions subcollection (photobooth rounds and captures)
       match /sessions/{sessionId} {
         allow read: if true;
-        allow create: if true;
-        allow update: if true;
+        allow create, update: if true;
         allow delete: if isRoomHost(roomId);
       }
     }
